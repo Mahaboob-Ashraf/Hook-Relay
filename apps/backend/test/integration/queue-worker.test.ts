@@ -1,7 +1,7 @@
 import { createServer, type Server } from "node:http";
 import { createServer as createTcpServer, connect, type Server as TcpServer, type Socket } from "node:net";
 import { resolve } from "node:path";
-import { count, eq } from "drizzle-orm";
+import { asc, count, eq } from "drizzle-orm";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import type { FastifyInstance } from "fastify";
 import postgres from "postgres";
@@ -12,7 +12,12 @@ import {
   type DemoReceiverResources,
 } from "../../src/demo-receiver/app.js";
 import { createDatabase, type DatabaseResources } from "../../src/db/client.js";
-import { deliveries, deliveryAttempts, events } from "../../src/db/schema.js";
+import {
+  deliveries,
+  deliveryAttempts,
+  events,
+  webhookEndpoints,
+} from "../../src/db/schema.js";
 import {
   createDeliveryQueue,
   type DeliveryQueueResources,
@@ -27,6 +32,7 @@ import {
   createDeliveryRetryPolicy,
   type DeliveryRetryPolicy,
 } from "../../src/retry/delivery-retry-policy.js";
+import { startDeliveryAttempt } from "../../src/worker/delivery-attempt-store.js";
 
 const adminDatabaseUrl =
   process.env.HOOKRELAY_TEST_ADMIN_DATABASE_URL ??
@@ -124,7 +130,7 @@ class RedisTcpProxy {
   }
 }
 
-describe("Task 3-5 BullMQ delivery pipeline", () => {
+describe("Task 3-6 BullMQ delivery pipeline", () => {
   let database: DatabaseResources;
   let receiver: Server;
   let receiverUrl: string;
@@ -275,6 +281,40 @@ describe("Task 3-5 BullMQ delivery pipeline", () => {
     return delivery;
   }
 
+  function readAttempts(deliveryId: string) {
+    return database.db
+      .select()
+      .from(deliveryAttempts)
+      .where(eq(deliveryAttempts.deliveryId, deliveryId))
+      .orderBy(asc(deliveryAttempts.attemptNumber));
+  }
+
+  async function createPersistedDelivery(key: string): Promise<string> {
+    const [endpoint] = await database.db
+      .insert(webhookEndpoints)
+      .values({
+        name: "Attempt persistence fixture",
+        url: receiverUrl,
+        signingSecret: "task6-persistence-secret",
+      })
+      .returning({ id: webhookEndpoints.id });
+    const [event] = await database.db
+      .insert(events)
+      .values({
+        eventType: "attempt.persistence",
+        payload: { fixture: true },
+        idempotencyKey: key,
+      })
+      .returning({ id: events.id });
+    if (!endpoint || !event) throw new Error("Failed to create attempt fixture.");
+    const [delivery] = await database.db
+      .insert(deliveries)
+      .values({ eventId: event.id, endpointId: endpoint.id })
+      .returning({ id: deliveries.id });
+    if (!delivery) throw new Error("Failed to create delivery fixture.");
+    return delivery.id;
+  }
+
   it("delivers the canonical payload and deduplicates repeated scheduling", async () => {
     await startRuntime();
     const endpointId = await createEndpoint();
@@ -288,7 +328,16 @@ describe("Task 3-5 BullMQ delivery pipeline", () => {
     );
     expect(receivedBodies).toEqual([{ metadata: { a: 1, b: 2 }, orderId: 123 }]);
     expect(delivered?.deliveredAt).toBeInstanceOf(Date);
-    expect(delivered?.attemptCount).toBe(0);
+    expect(delivered?.attemptCount).toBe(1);
+    expect(await readAttempts(firstBody.delivery.id)).toMatchObject([
+      {
+        attemptNumber: 1,
+        responseStatus: 204,
+        completedAt: expect.any(Date),
+        latencyMs: expect.any(Number),
+        errorMessage: null,
+      },
+    ]);
 
     const job = await queue?.queue.getJob(firstBody.delivery.id);
     expect(job?.id).toBe(firstBody.delivery.id);
@@ -304,12 +353,52 @@ describe("Task 3-5 BullMQ delivery pipeline", () => {
 
     await processDelivery(database.db, { deliveryId: firstBody.delivery.id });
     expect(receivedBodies).toHaveLength(1);
+    expect(await readAttempts(firstBody.delivery.id)).toHaveLength(1);
 
     const [eventCount] = await database.db.select({ value: count() }).from(events);
     const [deliveryCount] = await database.db.select({ value: count() }).from(deliveries);
     expect(eventCount?.value).toBe(1);
     expect(deliveryCount?.value).toBe(1);
   }, 15_000);
+
+  it("preserves incomplete attempts and allocates a new durable number", async () => {
+    const deliveryId = await createPersistedDelivery("task6-incomplete-attempt");
+    const first = await startDeliveryAttempt(database.db, deliveryId);
+    const second = await startDeliveryAttempt(database.db, deliveryId);
+
+    expect(first?.attemptNumber).toBe(1);
+    expect(second?.attemptNumber).toBe(2);
+    const delivery = await readDelivery(deliveryId);
+    expect(delivery?.attemptCount).toBe(2);
+    const attempts = await readAttempts(deliveryId);
+    expect(attempts.map((attempt) => attempt.attemptNumber)).toEqual([1, 2]);
+    expect(attempts).toEqual([
+      expect.objectContaining({
+        id: first?.id,
+        startedAt: expect.any(Date),
+        completedAt: null,
+        responseStatus: null,
+        latencyMs: null,
+        errorMessage: null,
+      }),
+      expect.objectContaining({
+        id: second?.id,
+        startedAt: expect.any(Date),
+        completedAt: null,
+        responseStatus: null,
+        latencyMs: null,
+        errorMessage: null,
+      }),
+    ]);
+
+    await expect(
+      database.db.insert(deliveryAttempts).values({
+        deliveryId,
+        attemptNumber: 1,
+      }),
+    ).rejects.toThrow();
+    expect(await readAttempts(deliveryId)).toHaveLength(2);
+  });
 
   it("rejects malformed job identity before loading delivery data", async () => {
     await expect(
@@ -403,14 +492,24 @@ describe("Task 3-5 BullMQ delivery pipeline", () => {
     expect(failedJob?.id).toBe(deliveryId);
 
     const delivery = await readDelivery(deliveryId);
-    expect(delivery?.status).toBe("queued");
+    expect(delivery?.status).toBe("dead_letter");
     expect(delivery?.deliveredAt).toBeNull();
     expect(delivery?.nextAttemptAt).toBeNull();
-    expect(delivery?.attemptCount).toBe(0);
-    const [attemptCount] = await database.db
-      .select({ value: count() })
-      .from(deliveryAttempts);
-    expect(attemptCount?.value).toBe(0);
+    expect(delivery?.attemptCount).toBe(5);
+    const attempts = await readAttempts(deliveryId);
+    expect(attempts.map((attempt) => attempt.attemptNumber)).toEqual([
+      1, 2, 3, 4, 5,
+    ]);
+    for (const attempt of attempts) {
+      expect(attempt).toMatchObject({
+        deliveryId,
+        responseStatus: 500,
+        completedAt: expect.any(Date),
+        latencyMs: expect.any(Number),
+        errorMessage: "HTTP 500",
+      });
+      expect(attempt.latencyMs).toBeGreaterThanOrEqual(0);
+    }
     expect(receivedBodies).toHaveLength(5);
     expect(new Set(receivedEventIds)).toEqual(new Set([response?.json().event.id]));
     await new Promise((resolve) => setTimeout(resolve, 200));
@@ -442,12 +541,17 @@ describe("Task 3-5 BullMQ delivery pipeline", () => {
     });
     expect(state?.lastRequest.timestamp).toMatch(/^[0-9]+$/);
     expect(delivered?.deliveredAt).toBeInstanceOf(Date);
-    expect(delivered?.attemptCount).toBe(0);
-
-    const [attemptCount] = await database.db
-      .select({ value: count() })
-      .from(deliveryAttempts);
-    expect(attemptCount?.value).toBe(0);
+    expect(delivered?.attemptCount).toBe(1);
+    const attempts = await readAttempts(accepted.delivery.id);
+    expect(attempts).toMatchObject([
+      {
+        attemptNumber: 1,
+        responseStatus: 200,
+        completedAt: expect.any(Date),
+        errorMessage: null,
+      },
+    ]);
+    expect(attempts[0]?.latencyMs).toBeGreaterThanOrEqual(0);
   }, 15_000);
 
   it("automatically retries signed 500, 500, 200 responses on one identity", async () => {
@@ -483,7 +587,7 @@ describe("Task 3-5 BullMQ delivery pipeline", () => {
     expect(new Set(state?.requests.map((request) => request.timestamp)).size).toBe(3);
     expect(delivered?.deliveredAt).toBeInstanceOf(Date);
     expect(delivered?.nextAttemptAt).toBeNull();
-    expect(delivered?.attemptCount).toBe(0);
+    expect(delivered?.attemptCount).toBe(3);
 
     const job = await queue?.queue.getJob(accepted.delivery.id);
     expect(job?.id).toBe(accepted.delivery.id);
@@ -492,12 +596,24 @@ describe("Task 3-5 BullMQ delivery pipeline", () => {
 
     const [eventCount] = await database.db.select({ value: count() }).from(events);
     const [deliveryCount] = await database.db.select({ value: count() }).from(deliveries);
-    const [attemptCount] = await database.db
-      .select({ value: count() })
-      .from(deliveryAttempts);
+    const attempts = await readAttempts(accepted.delivery.id);
     expect(eventCount?.value).toBe(1);
     expect(deliveryCount?.value).toBe(1);
-    expect(attemptCount?.value).toBe(0);
+    expect(attempts.map((attempt) => attempt.attemptNumber)).toEqual([1, 2, 3]);
+    expect(attempts.map((attempt) => attempt.responseStatus)).toEqual([
+      500,
+      500,
+      200,
+    ]);
+    expect(attempts.map((attempt) => attempt.errorMessage)).toEqual([
+      "HTTP 500",
+      "HTTP 500",
+      null,
+    ]);
+    for (const attempt of attempts) {
+      expect(attempt.completedAt).toBeInstanceOf(Date);
+      expect(attempt.latencyMs).toBeGreaterThanOrEqual(0);
+    }
   }, 15_000);
 
   it("persists retry_scheduled and the shared expected next-attempt delay", async () => {
@@ -521,6 +637,15 @@ describe("Task 3-5 BullMQ delivery pipeline", () => {
     const remainingDelayMs = retryScheduled!.nextAttemptAt!.getTime() - Date.now();
     expect(remainingDelayMs).toBeGreaterThan(300);
     expect(remainingDelayMs).toBeLessThanOrEqual(retryDelayMs + 100);
+    expect(retryScheduled?.attemptCount).toBe(1);
+    expect(await readAttempts(deliveryId)).toMatchObject([
+      {
+        attemptNumber: 1,
+        responseStatus: 500,
+        completedAt: expect.any(Date),
+        errorMessage: "HTTP 500",
+      },
+    ]);
     const delayedJob = await queue?.queue.getJob(deliveryId);
     expect(await delayedJob?.getState()).toBe("delayed");
 
@@ -529,6 +654,7 @@ describe("Task 3-5 BullMQ delivery pipeline", () => {
       (value) => value?.status === "delivered",
     );
     expect(delivered?.nextAttemptAt).toBeNull();
+    expect(delivered?.attemptCount).toBe(2);
     expect(demoReceiver.getScenarioState(scenario)?.responseStatuses).toEqual([
       500,
       200,
@@ -549,14 +675,20 @@ describe("Task 3-5 BullMQ delivery pipeline", () => {
     expect(failedJob?.attemptsMade).toBe(1);
     expect(failedJob?.opts.attempts).toBe(5);
     const delivery = await readDelivery(deliveryId);
-    expect(delivery?.status).toBe("queued");
+    expect(delivery?.status).toBe("dead_letter");
     expect(delivery?.deliveredAt).toBeNull();
     expect(delivery?.nextAttemptAt).toBeNull();
-    expect(delivery?.attemptCount).toBe(0);
-    const [attemptCount] = await database.db
-      .select({ value: count() })
-      .from(deliveryAttempts);
-    expect(attemptCount?.value).toBe(0);
+    expect(delivery?.attemptCount).toBe(1);
+    const attempts = await readAttempts(deliveryId);
+    expect(attempts).toMatchObject([
+      {
+        attemptNumber: 1,
+        responseStatus: 400,
+        completedAt: expect.any(Date),
+        errorMessage: "HTTP 400",
+      },
+    ]);
+    expect(attempts[0]?.latencyMs).toBeGreaterThanOrEqual(0);
     await new Promise((resolve) => setTimeout(resolve, 200));
     expect(receivedBodies).toHaveLength(1);
   }, 15_000);
@@ -575,6 +707,14 @@ describe("Task 3-5 BullMQ delivery pipeline", () => {
     expect(receivedBodies).toHaveLength(2);
     expect(receivedEventIds).toEqual([accepted.event.id, accepted.event.id]);
     expect(delivered?.nextAttemptAt).toBeNull();
+    expect(delivered?.attemptCount).toBe(2);
+    const attempts = await readAttempts(accepted.delivery.id);
+    expect(attempts.map((attempt) => attempt.attemptNumber)).toEqual([1, 2]);
+    expect(attempts.map((attempt) => attempt.responseStatus)).toEqual([429, 200]);
+    expect(attempts.map((attempt) => attempt.errorMessage)).toEqual([
+      "HTTP 429",
+      null,
+    ]);
     const job = await queue?.queue.getJob(accepted.delivery.id);
     expect(job?.attemptsMade).toBe(2);
     expect(await job?.getState()).toBe("completed");
@@ -597,16 +737,66 @@ describe("Task 3-5 BullMQ delivery pipeline", () => {
     expect(failedJob?.attemptsMade).toBe(5);
     expect(receivedBodies).toHaveLength(5);
     const delivery = await readDelivery(deliveryId);
-    expect(delivery?.status).toBe("queued");
+    expect(delivery?.status).toBe("dead_letter");
     expect(delivery?.deliveredAt).toBeNull();
     expect(delivery?.nextAttemptAt).toBeNull();
-    expect(delivery?.attemptCount).toBe(0);
-    const [attemptCount] = await database.db
-      .select({ value: count() })
-      .from(deliveryAttempts);
-    expect(attemptCount?.value).toBe(0);
+    expect(delivery?.attemptCount).toBe(5);
+    const attempts = await readAttempts(deliveryId);
+    expect(attempts.map((attempt) => attempt.attemptNumber)).toEqual([
+      1, 2, 3, 4, 5,
+    ]);
+    for (const attempt of attempts) {
+      expect(attempt.responseStatus).toBeNull();
+      expect(attempt.completedAt).toBeInstanceOf(Date);
+      expect(attempt.latencyMs).toBeGreaterThanOrEqual(0);
+      expect(attempt.errorMessage).toBe("Webhook request timed out");
+    }
     await new Promise((resolve) => setTimeout(resolve, 200));
     expect(receivedBodies).toHaveLength(5);
+  }, 15_000);
+
+  it("persists normalized network failures without an HTTP status", async () => {
+    const closedPortServer = createServer();
+    await new Promise<void>((resolveListen) => {
+      closedPortServer.listen(0, "127.0.0.1", () => resolveListen());
+    });
+    const closedAddress = closedPortServer.address();
+    if (typeof closedAddress !== "object" || !closedAddress) {
+      throw new Error("Closed-port fixture did not expose an address.");
+    }
+    await new Promise<void>((resolveClose) =>
+      closedPortServer.close(() => resolveClose()),
+    );
+
+    await startRuntime({
+      retryPolicy: createDeliveryRetryPolicy([10, 10, 10, 10]),
+    });
+    const endpointId = await createEndpoint({
+      url: `http://127.0.0.1:${closedAddress.port}/webhook`,
+    });
+    const response = await ingest(endpointId, "task6-network-exhausted");
+    const deliveryId = response?.json().delivery.id as string;
+
+    const failedJob = await waitFor(
+      () => queue!.queue.getJob(deliveryId),
+      async (job) => (job ? (await job.getState()) === "failed" : false),
+    );
+    expect(failedJob?.attemptsMade).toBe(5);
+    const delivery = await readDelivery(deliveryId);
+    expect(delivery).toMatchObject({
+      status: "dead_letter",
+      attemptCount: 5,
+      deliveredAt: null,
+      nextAttemptAt: null,
+    });
+    const attempts = await readAttempts(deliveryId);
+    expect(attempts).toHaveLength(5);
+    for (const attempt of attempts) {
+      expect(attempt.responseStatus).toBeNull();
+      expect(attempt.completedAt).toBeInstanceOf(Date);
+      expect(attempt.latencyMs).toBeGreaterThanOrEqual(0);
+      expect(attempt.errorMessage).toMatch(/^Network error/);
+    }
   }, 15_000);
 
   it("does not deliver when the endpoint signing secret is wrong", async () => {
@@ -627,17 +817,22 @@ describe("Task 3-5 BullMQ delivery pipeline", () => {
     expect(await failedJob?.getState()).toBe("failed");
     expect(failedJob?.attemptsMade).toBe(1);
     const delivery = await readDelivery(deliveryId);
-    expect(delivery?.status).toBe("queued");
+    expect(delivery?.status).toBe("dead_letter");
     expect(delivery?.deliveredAt).toBeNull();
-    expect(delivery?.attemptCount).toBe(0);
+    expect(delivery?.nextAttemptAt).toBeNull();
+    expect(delivery?.attemptCount).toBe(1);
     expect(demoReceiver.getScenarioState(scenario)).toBeUndefined();
     await new Promise((resolve) => setTimeout(resolve, 500));
     expect(demoReceiver.getScenarioState(scenario)).toBeUndefined();
 
-    const [attemptCount] = await database.db
-      .select({ value: count() })
-      .from(deliveryAttempts);
-    expect(attemptCount?.value).toBe(0);
+    expect(await readAttempts(deliveryId)).toMatchObject([
+      {
+        attemptNumber: 1,
+        responseStatus: 401,
+        completedAt: expect.any(Date),
+        errorMessage: "HTTP 401",
+      },
+    ]);
   }, 15_000);
 
   it("serves the controlled 500, 500, 200 boundary over real HTTP", async () => {
@@ -674,5 +869,56 @@ describe("Task 3-5 BullMQ delivery pipeline", () => {
       validRequestCount: 3,
       lastRequest: { rawBody },
     });
+  }, 15_000);
+
+  it("leaves coherent delivered and dead-letter histories for database inspection", async () => {
+    await startRuntime();
+    const deliveredEndpointId = await createEndpoint({
+      url: `${demoReceiverUrl}/demo/webhook?scenario=task6-db-delivered&fail_first=2`,
+      signingSecret: "task4-demo-secret",
+    });
+    const deadLetterEndpointId = await createEndpoint({
+      url: `${demoReceiverUrl}/demo/webhook?scenario=task6-db-dead-letter&fail_first=100`,
+      signingSecret: "task4-demo-secret",
+    });
+    const deliveredResponse = await ingest(
+      deliveredEndpointId,
+      "task6-manual-db-delivered",
+    );
+    const deadLetterResponse = await ingest(
+      deadLetterEndpointId,
+      "task6-manual-db-dead-letter",
+    );
+    const deliveredId = deliveredResponse?.json().delivery.id as string;
+    const deadLetterId = deadLetterResponse?.json().delivery.id as string;
+
+    const delivered = await waitFor(
+      () => readDelivery(deliveredId),
+      (value) => value?.status === "delivered",
+    );
+    const deadLetter = await waitFor(
+      () => readDelivery(deadLetterId),
+      (value) => value?.status === "dead_letter",
+    );
+    expect(delivered).toMatchObject({
+      status: "delivered",
+      attemptCount: 3,
+      nextAttemptAt: null,
+    });
+    expect(delivered?.deliveredAt).toBeInstanceOf(Date);
+    expect(deadLetter).toMatchObject({
+      status: "dead_letter",
+      attemptCount: 5,
+      deliveredAt: null,
+      nextAttemptAt: null,
+    });
+    expect(
+      (await readAttempts(deliveredId)).map((attempt) => attempt.responseStatus),
+    ).toEqual([500, 500, 200]);
+    expect(
+      (await readAttempts(deadLetterId)).map(
+        (attempt) => attempt.responseStatus,
+      ),
+    ).toEqual([500, 500, 500, 500, 500]);
   }, 15_000);
 });

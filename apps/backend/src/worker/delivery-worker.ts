@@ -1,9 +1,11 @@
-import { and, eq } from "drizzle-orm";
+import { performance } from "node:perf_hooks";
+import { eq } from "drizzle-orm";
 import { UnrecoverableError, Worker } from "bullmq";
 import { z } from "zod";
 import type { AppDatabase } from "../db/client.js";
 import { deliveries, events, webhookEndpoints } from "../db/schema.js";
 import { serializeJsonDeterministically } from "../domain/ingestion.js";
+import { normalizeDeliveryAttemptResult } from "../domain/delivery-attempt-result.js";
 import { createWebhookSignature } from "../signing/webhook-signature.js";
 import {
   DELIVERY_BACKOFF_STRATEGY,
@@ -16,12 +18,16 @@ import {
   type RedisClient,
 } from "../redis/client.js";
 import {
-  classifyDeliveryResult,
   getRetryDelayMs,
   PRODUCTION_RETRY_POLICY,
-  type DeliveryResultClassification,
   type DeliveryRetryPolicy,
 } from "../retry/delivery-retry-policy.js";
+import {
+  finalizeDeliveryAttempt,
+  startDeliveryAttempt,
+  type DeliveryAttemptFinalization,
+  type StartedDeliveryAttempt,
+} from "./delivery-attempt-store.js";
 
 const DEFAULT_WEBHOOK_TIMEOUT_MS = 5_000;
 
@@ -52,30 +58,50 @@ class WebhookRequestTimeoutError extends Error {
   }
 }
 
-async function persistFailedDelivery(
+function createFailureFinalization(
+  result: ReturnType<typeof normalizeDeliveryAttemptResult>,
+  currentAttempt: number,
+  totalAttempts: number,
+  retryPolicy: DeliveryRetryPolicy,
+): DeliveryAttemptFinalization {
+  const retryDelayMs =
+    result.classification === "retryable" && currentAttempt < totalAttempts
+      ? getRetryDelayMs(currentAttempt, retryPolicy)
+      : undefined;
+  const completedAt = new Date();
+  return {
+    completedAt,
+    responseStatus: result.responseStatus,
+    latencyMs: result.latencyMs,
+    errorMessage: result.errorMessage,
+    deliveryStatus:
+      retryDelayMs === undefined ? "dead_letter" : "retry_scheduled",
+    nextAttemptAt:
+      retryDelayMs === undefined
+        ? null
+        : new Date(completedAt.getTime() + retryDelayMs),
+    deliveredAt: null,
+  };
+}
+
+async function persistFailure(
   db: AppDatabase,
-  deliveryId: string,
-  classification: Exclude<DeliveryResultClassification, "success">,
+  attempt: StartedDeliveryAttempt,
+  result: ReturnType<typeof normalizeDeliveryAttemptResult>,
   currentAttempt: number,
   totalAttempts: number,
   retryPolicy: DeliveryRetryPolicy,
 ): Promise<void> {
-  const retryDelayMs =
-    classification === "retryable" && currentAttempt < totalAttempts
-      ? getRetryDelayMs(currentAttempt, retryPolicy)
-      : undefined;
-
-  await db
-    .update(deliveries)
-    .set({
-      status: retryDelayMs === undefined ? "queued" : "retry_scheduled",
-      nextAttemptAt:
-        retryDelayMs === undefined ? null : new Date(Date.now() + retryDelayMs),
-      deliveredAt: null,
-    })
-    .where(
-      and(eq(deliveries.id, deliveryId), eq(deliveries.status, "delivering")),
-    );
+  await finalizeDeliveryAttempt(
+    db,
+    attempt,
+    createFailureFinalization(
+      result,
+      currentAttempt,
+      totalAttempts,
+      retryPolicy,
+    ),
+  );
 }
 
 async function sendWebhook(
@@ -137,14 +163,15 @@ export async function processDelivery(
     );
   }
 
-  if (canonical.deliveryStatus === "delivered") {
+  if (
+    canonical.deliveryStatus === "delivered" ||
+    canonical.deliveryStatus === "dead_letter"
+  ) {
     return;
   }
 
-  await db
-    .update(deliveries)
-    .set({ status: "delivering", nextAttemptAt: null })
-    .where(eq(deliveries.id, canonical.deliveryId));
+  const attempt = await startDeliveryAttempt(db, canonical.deliveryId);
+  if (!attempt) return;
 
   const rawBody = serializeJsonDeterministically(canonical.payload);
   const timestamp = Math.floor(Date.now() / 1000).toString();
@@ -155,6 +182,7 @@ export async function processDelivery(
   );
 
   let response: Response;
+  const requestStartedAt = performance.now();
   try {
     response = await sendWebhook(
       canonical.endpointUrl,
@@ -172,52 +200,60 @@ export async function processDelivery(
       requestTimeoutMs,
     );
   } catch (error) {
-    const classification = classifyDeliveryResult(
-      error instanceof WebhookRequestTimeoutError ? "timeout" : "network",
+    const result = normalizeDeliveryAttemptResult(
+      error instanceof WebhookRequestTimeoutError
+        ? { kind: "timeout", elapsedMs: performance.now() - requestStartedAt }
+        : {
+            kind: "network",
+            elapsedMs: performance.now() - requestStartedAt,
+            error,
+          },
     );
-    if (classification !== "retryable") {
-      throw new Error("Network and timeout failures must be retryable.");
-    }
-    await persistFailedDelivery(
+    await persistFailure(
       db,
-      canonical.deliveryId,
-      classification,
+      attempt,
+      result,
       currentAttempt,
       totalAttempts,
       retryPolicy,
     );
-    const message =
-      error instanceof Error ? error.message : "Unknown delivery network error";
+    const message = result.errorMessage ?? "Unknown delivery network error";
     throw new Error(`Delivery ${canonical.deliveryId} failed: ${message}`, {
       cause: error,
     });
   }
 
-  const classification = classifyDeliveryResult("http", response.status);
-  if (classification !== "success") {
-    await persistFailedDelivery(
+  const result = normalizeDeliveryAttemptResult({
+    kind: "http",
+    statusCode: response.status,
+    elapsedMs: performance.now() - requestStartedAt,
+  });
+  if (result.classification !== "success") {
+    await persistFailure(
       db,
-      canonical.deliveryId,
-      classification,
+      attempt,
+      result,
       currentAttempt,
       totalAttempts,
       retryPolicy,
     );
-    const message = `Delivery ${canonical.deliveryId} failed: Endpoint returned HTTP ${response.status}.`;
-    if (classification === "terminal") {
+    const message = `Delivery ${canonical.deliveryId} failed: ${result.errorMessage}.`;
+    if (result.classification === "terminal") {
       throw new UnrecoverableError(message);
     }
     throw new Error(message);
   }
 
-  await db
-    .update(deliveries)
-    .set({
-      status: "delivered",
-      deliveredAt: new Date(),
-      nextAttemptAt: null,
-    })
-    .where(eq(deliveries.id, canonical.deliveryId));
+  const completedAt = new Date();
+  await finalizeDeliveryAttempt(db, attempt, {
+    completedAt,
+    responseStatus: result.responseStatus,
+    latencyMs: result.latencyMs,
+    errorMessage: result.errorMessage,
+    deliveryStatus: "delivered",
+    deliveredAt: completedAt,
+    nextAttemptAt: null,
+  });
 }
 
 export function createDeliveryWorker(
