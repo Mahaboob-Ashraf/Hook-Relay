@@ -85,10 +85,19 @@ export const deliveries = pgTable(
       (): AnyPgColumn => deliveries.id,
       { onDelete: "set null" },
     ),
+    replayIdempotencyKey: text("replay_idempotency_key"),
     createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
   },
   (table) => [
     check("deliveries_attempt_count_nonnegative", sql`${table.attemptCount} >= 0`),
+    check(
+      "deliveries_replay_idempotency_key_nonempty",
+      sql`${table.replayIdempotencyKey} is null or char_length(btrim(${table.replayIdempotencyKey})) > 0`,
+    ),
+    unique("deliveries_replay_idempotency_unique").on(
+      table.replayedFromDeliveryId,
+      table.replayIdempotencyKey,
+    ),
     index("deliveries_event_id_idx").on(table.eventId),
     index("deliveries_endpoint_id_idx").on(table.endpointId),
     index("deliveries_status_next_attempt_idx").on(table.status, table.nextAttemptAt),
@@ -119,4 +128,3 @@ export const deliveryAttempts = pgTable(
     index("delivery_attempts_delivery_id_idx").on(table.deliveryId),
   ],
 );
-

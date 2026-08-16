@@ -1,7 +1,7 @@
 import { createServer, type Server } from "node:http";
 import { createServer as createTcpServer, connect, type Server as TcpServer, type Socket } from "node:net";
 import { resolve } from "node:path";
-import { asc, count, eq } from "drizzle-orm";
+import { and, asc, count, eq } from "drizzle-orm";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import type { FastifyInstance } from "fastify";
 import postgres from "postgres";
@@ -33,6 +33,7 @@ import {
   type DeliveryRetryPolicy,
 } from "../../src/retry/delivery-retry-policy.js";
 import { startDeliveryAttempt } from "../../src/worker/delivery-attempt-store.js";
+import { replayDelivery } from "../../src/domain/replay.js";
 
 const adminDatabaseUrl =
   process.env.HOOKRELAY_TEST_ADMIN_DATABASE_URL ??
@@ -130,7 +131,7 @@ class RedisTcpProxy {
   }
 }
 
-describe("Task 3-6 BullMQ delivery pipeline", () => {
+describe("Task 3-7 BullMQ delivery pipeline", () => {
   let database: DatabaseResources;
   let receiver: Server;
   let receiverUrl: string;
@@ -273,6 +274,15 @@ describe("Task 3-6 BullMQ delivery pipeline", () => {
     });
   }
 
+  function replay(deliveryId: string, key?: string) {
+    if (!app) throw new Error("Test API has not been started.");
+    return app.inject({
+      method: "POST",
+      url: `/deliveries/${deliveryId}/replay`,
+      ...(key === undefined ? {} : { headers: { "idempotency-key": key } }),
+    });
+  }
+
   async function readDelivery(deliveryId: string) {
     const [delivery] = await database.db
       .select()
@@ -313,6 +323,15 @@ describe("Task 3-6 BullMQ delivery pipeline", () => {
       .returning({ id: deliveries.id });
     if (!delivery) throw new Error("Failed to create delivery fixture.");
     return delivery.id;
+  }
+
+  async function createDeadLetterDelivery(key: string): Promise<string> {
+    const deliveryId = await createPersistedDelivery(key);
+    await database.db
+      .update(deliveries)
+      .set({ status: "dead_letter" })
+      .where(eq(deliveries.id, deliveryId));
+    return deliveryId;
   }
 
   it("delivers the canonical payload and deduplicates repeated scheduling", async () => {
@@ -920,5 +939,313 @@ describe("Task 3-6 BullMQ delivery pipeline", () => {
         (attempt) => attempt.responseStatus,
       ),
     ).toEqual([500, 500, 500, 500, 500]);
+  }, 15_000);
+
+  it("replays a dead-letter delivery without mutating its source or attempt history", async () => {
+    await startRuntime();
+    const scenario = "task7-source-preservation";
+    const endpointId = await createEndpoint({
+      url: `${demoReceiverUrl}/demo/webhook?scenario=${scenario}&fail_first=5`,
+      signingSecret: "task4-demo-secret",
+    });
+    const accepted = await ingest(endpointId, "task7-source-preservation");
+    const sourceId = accepted?.json().delivery.id as string;
+    const eventId = accepted?.json().event.id as string;
+
+    const sourceBefore = await waitFor(
+      () => readDelivery(sourceId),
+      (value) => value?.status === "dead_letter",
+    );
+    const attemptsBefore = await readAttempts(sourceId);
+    expect(sourceBefore?.attemptCount).toBe(5);
+
+    const response = await replay(sourceId, "task7-first-replay");
+    expect(response?.statusCode).toBe(201);
+    const body = response?.json();
+    expect(body).toMatchObject({
+      reused: false,
+      scheduled: true,
+      sourceDelivery: { id: sourceId, status: "dead_letter" },
+      replayDelivery: {
+        eventId,
+        endpointId,
+        status: "queued",
+        attemptCount: 0,
+        nextAttemptAt: null,
+        deliveredAt: null,
+        replayedFromDeliveryId: sourceId,
+      },
+    });
+    expect(body.replayDelivery.id).not.toBe(sourceId);
+
+    const replayed = await waitFor(
+      () => readDelivery(body.replayDelivery.id),
+      (value) => value?.status === "delivered",
+    );
+    expect(replayed).toMatchObject({
+      eventId,
+      endpointId,
+      status: "delivered",
+      attemptCount: 1,
+      replayedFromDeliveryId: sourceId,
+      replayIdempotencyKey: "task7-first-replay",
+    });
+    expect(await readDelivery(sourceId)).toEqual(sourceBefore);
+    expect(await readAttempts(sourceId)).toEqual(attemptsBefore);
+    expect(await readAttempts(body.replayDelivery.id)).toMatchObject([
+      { attemptNumber: 1, responseStatus: 200, errorMessage: null },
+    ]);
+    const receiverState = demoReceiver.getScenarioState(scenario);
+    expect(receiverState?.validRequestCount).toBe(6);
+    expect(new Set(receiverState?.requests.map((request) => request.eventId))).toEqual(
+      new Set([eventId]),
+    );
+  }, 15_000);
+
+  it("gives a replay a fresh five-attempt budget and independent history", async () => {
+    await startRuntime();
+    const scenario = "task7-fresh-budget";
+    const endpointId = await createEndpoint({
+      url: `${demoReceiverUrl}/demo/webhook?scenario=${scenario}&fail_first=7`,
+      signingSecret: "task4-demo-secret",
+    });
+    const accepted = await ingest(endpointId, "task7-fresh-budget");
+    const sourceId = accepted?.json().delivery.id as string;
+    await waitFor(
+      () => readDelivery(sourceId),
+      (value) => value?.status === "dead_letter",
+    );
+
+    const response = await replay(sourceId, "task7-fresh-budget-replay");
+    expect(response?.statusCode).toBe(201);
+    const replayId = response?.json().replayDelivery.id as string;
+    const delivered = await waitFor(
+      () => readDelivery(replayId),
+      (value) => value?.status === "delivered",
+    );
+
+    expect(await readDelivery(sourceId)).toMatchObject({
+      status: "dead_letter",
+      attemptCount: 5,
+    });
+    expect(delivered).toMatchObject({
+      status: "delivered",
+      attemptCount: 3,
+      replayedFromDeliveryId: sourceId,
+    });
+    expect((await readAttempts(sourceId)).map((attempt) => attempt.responseStatus)).toEqual([
+      500,
+      500,
+      500,
+      500,
+      500,
+    ]);
+    expect((await readAttempts(replayId)).map((attempt) => attempt.responseStatus)).toEqual([
+      500,
+      500,
+      200,
+    ]);
+    const replayJob = await queue?.queue.getJob(replayId);
+    expect(replayJob?.id).toBe(replayId);
+    expect(replayJob?.attemptsMade).toBe(3);
+    expect(demoReceiver.getScenarioState(scenario)?.responseStatuses).toEqual([
+      500,
+      500,
+      500,
+      500,
+      500,
+      500,
+      500,
+      200,
+    ]);
+  }, 15_000);
+
+  it("reuses sequential duplicate replay requests and permits a different key", async () => {
+    await startRuntime();
+    const sourceId = await createDeadLetterDelivery("task7-sequential-source");
+
+    const first = await replay(sourceId, "task7-sequential-key");
+    const duplicate = await replay(sourceId, "task7-sequential-key");
+    const different = await replay(sourceId, "task7-different-key");
+
+    expect(first?.statusCode).toBe(201);
+    expect(first?.json().reused).toBe(false);
+    expect(duplicate?.statusCode).toBe(200);
+    expect(duplicate?.json()).toMatchObject({
+      reused: true,
+      replayDelivery: { id: first?.json().replayDelivery.id },
+    });
+    expect(different?.statusCode).toBe(201);
+    expect(different?.json().replayDelivery.id).not.toBe(
+      first?.json().replayDelivery.id,
+    );
+
+    const children = await database.db
+      .select()
+      .from(deliveries)
+      .where(eq(deliveries.replayedFromDeliveryId, sourceId));
+    expect(children).toHaveLength(2);
+    expect(new Set(children.map((delivery) => delivery.replayIdempotencyKey))).toEqual(
+      new Set(["task7-sequential-key", "task7-different-key"]),
+    );
+  }, 15_000);
+
+  it("resolves concurrent duplicate replay requests to one durable delivery", async () => {
+    await startRuntime();
+    const sourceId = await createDeadLetterDelivery("task7-concurrent-source");
+
+    const responses = await Promise.all(
+      Array.from({ length: 8 }, () => replay(sourceId, "task7-concurrent-key")),
+    );
+    expect(responses.filter((response) => response?.statusCode === 201)).toHaveLength(1);
+    expect(responses.filter((response) => response?.statusCode === 200)).toHaveLength(7);
+    const ids = responses.map((response) => response?.json().replayDelivery.id);
+    expect(new Set(ids).size).toBe(1);
+
+    const [childCount] = await database.db
+      .select({ value: count() })
+      .from(deliveries)
+      .where(
+        and(
+          eq(deliveries.replayedFromDeliveryId, sourceId),
+          eq(deliveries.replayIdempotencyKey, "task7-concurrent-key"),
+        ),
+      );
+    expect(childCount?.value).toBe(1);
+  }, 15_000);
+
+  it("preserves a replay through a real Redis outage and schedules it on idempotent retry", async () => {
+    const proxy = new RedisTcpProxy();
+    await proxy.start();
+    try {
+      await startRuntime({ producerRedisUrl: proxy.url });
+      const sourceId = await createDeadLetterDelivery("task7-outage-source");
+      const sourceBefore = await readDelivery(sourceId);
+      await proxy.stop();
+
+      const unavailable = await replay(sourceId, "task7-outage-key");
+      expect(unavailable?.statusCode).toBe(503);
+      expect(unavailable?.json()).toMatchObject({
+        durableAccepted: true,
+        scheduled: false,
+        reused: false,
+        error: { code: "replay_scheduling_unavailable" },
+        sourceDelivery: { id: sourceId, status: "dead_letter" },
+        replayDelivery: {
+          status: "queued",
+          attemptCount: 0,
+          replayedFromDeliveryId: sourceId,
+        },
+      });
+      const replayId = unavailable?.json().replayDelivery.id as string;
+      expect(await readDelivery(replayId)).toMatchObject({
+        status: "queued",
+        attemptCount: 0,
+        nextAttemptAt: null,
+        deliveredAt: null,
+      });
+      expect(await readAttempts(replayId)).toHaveLength(0);
+      expect(await readDelivery(sourceId)).toEqual(sourceBefore);
+
+      await proxy.start();
+      const recovered = await waitFor(
+        () => replay(sourceId, "task7-outage-key"),
+        (response) => response?.statusCode === 200,
+        15_000,
+      );
+      expect(recovered?.json()).toMatchObject({
+        reused: true,
+        scheduled: true,
+        replayDelivery: { id: replayId },
+      });
+      await waitFor(
+        () => readDelivery(replayId),
+        (value) => value?.status === "delivered",
+      );
+
+      const [childCount] = await database.db
+        .select({ value: count() })
+        .from(deliveries)
+        .where(
+          and(
+            eq(deliveries.replayedFromDeliveryId, sourceId),
+            eq(deliveries.replayIdempotencyKey, "task7-outage-key"),
+          ),
+        );
+      expect(childCount?.value).toBe(1);
+    } finally {
+      await proxy.stop();
+    }
+  }, 25_000);
+
+  it("rejects invalid replay requests and every non-dead-letter status", async () => {
+    await startRuntime();
+    const sourceId = await createDeadLetterDelivery("task7-rejection-source");
+
+    const missingKey = await replay(sourceId);
+    expect(missingKey?.statusCode).toBe(400);
+    expect(missingKey?.json()).toMatchObject({ error: { code: "validation_error" } });
+    const invalidId = await replay("not-a-uuid", "task7-invalid-id");
+    expect(invalidId?.statusCode).toBe(400);
+    const missing = await replay(
+      "00000000-0000-4000-8000-000000000007",
+      "task7-not-found",
+    );
+    expect(missing?.statusCode).toBe(404);
+    expect(missing?.json()).toMatchObject({ error: { code: "delivery_not_found" } });
+
+    for (const status of [
+      "queued",
+      "delivering",
+      "retry_scheduled",
+      "delivered",
+    ] as const) {
+      await database.db
+        .update(deliveries)
+        .set({ status })
+        .where(eq(deliveries.id, sourceId));
+      const rejected = await replay(sourceId, `task7-reject-${status}`);
+      expect(rejected?.statusCode).toBe(409);
+      expect(rejected?.json()).toMatchObject({
+        error: { code: "delivery_not_replayable" },
+      });
+    }
+
+    const [childCount] = await database.db
+      .select({ value: count() })
+      .from(deliveries)
+      .where(eq(deliveries.replayedFromDeliveryId, sourceId));
+    expect(childCount?.value).toBe(0);
+  }, 15_000);
+
+  it("stores only immediate ancestry across a replay chain", async () => {
+    const sourceId = await createDeadLetterDelivery("task7-chain-source");
+    const sourceBefore = await readDelivery(sourceId);
+
+    const second = await replayDelivery(database.db, {
+      sourceDeliveryId: sourceId,
+      idempotencyKey: "task7-chain-second",
+    });
+    await database.db
+      .update(deliveries)
+      .set({ status: "dead_letter" })
+      .where(eq(deliveries.id, second.delivery.id));
+    const third = await replayDelivery(database.db, {
+      sourceDeliveryId: second.delivery.id,
+      idempotencyKey: "task7-chain-third",
+    });
+
+    expect(second.delivery).toMatchObject({
+      replayedFromDeliveryId: sourceId,
+      eventId: sourceBefore?.eventId,
+      endpointId: sourceBefore?.endpointId,
+    });
+    expect(third.delivery).toMatchObject({
+      replayedFromDeliveryId: second.delivery.id,
+      eventId: sourceBefore?.eventId,
+      endpointId: sourceBefore?.endpointId,
+    });
+    expect(third.delivery.replayedFromDeliveryId).not.toBe(sourceId);
+    expect(await readDelivery(sourceId)).toEqual(sourceBefore);
   }, 15_000);
 });

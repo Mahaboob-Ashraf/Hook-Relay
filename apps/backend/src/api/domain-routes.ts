@@ -7,6 +7,11 @@ import {
   IdempotencyConflictError,
   ingestEvent,
 } from "../domain/ingestion.js";
+import {
+  DeliveryNotFoundError,
+  DeliveryNotReplayableError,
+  replayDelivery,
+} from "../domain/replay.js";
 import type { DeliveryScheduler } from "../queue/delivery-queue.js";
 
 const endpointBodySchema = z.object({
@@ -25,6 +30,7 @@ const eventBodySchema = z.object({
 }).strict();
 
 const idempotencyKeySchema = z.string().trim().min(1);
+const replayParamsSchema = z.object({ deliveryId: z.uuid() });
 
 function sendValidationError(
   reply: FastifyReply,
@@ -144,6 +150,75 @@ export function registerDomainRoutes(
         return reply.code(409).send({
           error: {
             code: "idempotency_conflict",
+            message: error.message,
+          },
+        });
+      }
+
+      throw error;
+    }
+  });
+
+  app.post("/deliveries/:deliveryId/replay", async (request, reply) => {
+    const keyResult = idempotencyKeySchema.safeParse(request.headers["idempotency-key"]);
+    if (!keyResult.success) {
+      return sendValidationError(reply, "Idempotency-Key header is required and must be non-empty.");
+    }
+
+    const paramsResult = replayParamsSchema.safeParse(request.params);
+    if (!paramsResult.success) {
+      return sendValidationError(reply, "Invalid delivery ID.", paramsResult.error.issues);
+    }
+
+    try {
+      const result = await replayDelivery(db, {
+        sourceDeliveryId: paramsResult.data.deliveryId,
+        idempotencyKey: keyResult.data,
+      });
+      const response = {
+        sourceDelivery: result.sourceDelivery,
+        replayDelivery: result.delivery,
+        reused: result.reused,
+      };
+
+      if (scheduler) {
+        try {
+          await scheduler.scheduleDelivery(result.delivery.id);
+        } catch (error) {
+          request.log.warn(
+            { error, deliveryId: result.delivery.id },
+            "Durable replay delivery accepted but queue scheduling failed",
+          );
+          return reply.code(503).send({
+            error: {
+              code: "replay_scheduling_unavailable",
+              message:
+                "Replay delivery was durably accepted, but scheduling failed. Retry this request with the same Idempotency-Key.",
+            },
+            durableAccepted: true,
+            scheduled: false,
+            ...response,
+          });
+        }
+      }
+
+      return reply.code(result.reused ? 200 : 201).send({
+        scheduled: Boolean(scheduler),
+        ...response,
+      });
+    } catch (error) {
+      if (error instanceof DeliveryNotFoundError) {
+        return reply.code(404).send({
+          error: {
+            code: "delivery_not_found",
+            message: error.message,
+          },
+        });
+      }
+      if (error instanceof DeliveryNotReplayableError) {
+        return reply.code(409).send({
+          error: {
+            code: "delivery_not_replayable",
             message: error.message,
           },
         });

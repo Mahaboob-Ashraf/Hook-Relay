@@ -1,0 +1,3 @@
+ALTER TABLE "deliveries" ADD COLUMN "replay_idempotency_key" text;--> statement-breakpoint
+ALTER TABLE "deliveries" ADD CONSTRAINT "deliveries_replay_idempotency_unique" UNIQUE("replayed_from_delivery_id","replay_idempotency_key");--> statement-breakpoint
+ALTER TABLE "deliveries" ADD CONSTRAINT "deliveries_replay_idempotency_key_nonempty" CHECK ("deliveries"."replay_idempotency_key" is null or char_length(btrim("deliveries"."replay_idempotency_key")) > 0);
