@@ -6,8 +6,10 @@
   "scripts": {
     "dev:api": "tsx watch src/api/main.ts",
     "dev:worker": "tsx watch src/worker/main.ts",
+    "dev:receiver": "tsx watch src/demo-receiver/main.ts",
     "start:api": "tsx src/api/main.ts",
     "start:worker": "tsx src/worker/main.ts",
+    "start:receiver": "tsx src/demo-receiver/main.ts",
     "build": "tsc -p tsconfig.build.json",
     "test": "vitest run --exclude \"test/integration/**\"",
     "test:integration": "vitest run test/integration",

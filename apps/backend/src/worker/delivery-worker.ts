@@ -4,6 +4,7 @@ import { z } from "zod";
 import type { AppDatabase } from "../db/client.js";
 import { deliveries, events, webhookEndpoints } from "../db/schema.js";
 import { serializeJsonDeterministically } from "../domain/ingestion.js";
+import { createWebhookSignature } from "../signing/webhook-signature.js";
 import {
   DELIVERY_QUEUE_NAME,
   type DeliveryJobData,
@@ -38,8 +39,10 @@ export async function processDelivery(
       deliveryId: deliveries.id,
       deliveryStatus: deliveries.status,
       eventId: events.id,
+      eventType: events.eventType,
       payload: events.payload,
       endpointUrl: webhookEndpoints.url,
+      signingSecret: webhookEndpoints.signingSecret,
     })
     .from(deliveries)
     .innerJoin(events, eq(events.id, deliveries.eventId))
@@ -63,12 +66,23 @@ export async function processDelivery(
     .where(eq(deliveries.id, canonical.deliveryId));
 
   try {
+    const rawBody = serializeJsonDeterministically(canonical.payload);
+    const timestamp = Math.floor(Date.now() / 1000).toString();
+    const signature = createWebhookSignature(
+      canonical.signingSecret,
+      timestamp,
+      rawBody,
+    );
     const response = await fetch(canonical.endpointUrl, {
       method: "POST",
       headers: {
         "content-type": "application/json",
+        "x-hookrelay-event-id": canonical.eventId,
+        "x-hookrelay-event-type": canonical.eventType,
+        "x-hookrelay-timestamp": timestamp,
+        "x-hookrelay-signature": signature,
       },
-      body: serializeJsonDeterministically(canonical.payload),
+      body: rawBody,
     });
 
     if (response.status < 200 || response.status >= 300) {
@@ -122,4 +136,3 @@ export function createDeliveryWorker(
     },
   };
 }
-

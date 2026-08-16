@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { loadConfig } from "../src/config.js";
+import { loadConfig, loadDemoReceiverConfig } from "../src/config.js";
 
 const validEnvironment = {
   NODE_ENV: "test",
@@ -21,6 +21,26 @@ describe("loadConfig", () => {
 
   it("fails fast with useful field names", () => {
     expect(() => loadConfig({})).toThrow(/DATABASE_URL.*REDIS_URL/);
+  });
+});
+
+describe("loadDemoReceiverConfig", () => {
+  it("provides safe local defaults", () => {
+    expect(loadDemoReceiverConfig({})).toEqual({
+      port: 3400,
+      secret: "local-demo-secret",
+      maxAgeSeconds: 300,
+    });
+  });
+
+  it("validates receiver configuration", () => {
+    expect(() =>
+      loadDemoReceiverConfig({
+        DEMO_RECEIVER_PORT: "0",
+        DEMO_RECEIVER_SECRET: "",
+        DEMO_RECEIVER_MAX_AGE_SECONDS: "0",
+      }),
+    ).toThrow(/DEMO_RECEIVER_PORT.*DEMO_RECEIVER_SECRET.*DEMO_RECEIVER_MAX_AGE_SECONDS/);
   });
 });
 

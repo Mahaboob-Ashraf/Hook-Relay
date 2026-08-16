@@ -7,6 +7,10 @@ import type { FastifyInstance } from "fastify";
 import postgres from "postgres";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { buildApp } from "../../src/api/app.js";
+import {
+  createDemoReceiver,
+  type DemoReceiverResources,
+} from "../../src/demo-receiver/app.js";
 import { createDatabase, type DatabaseResources } from "../../src/db/client.js";
 import { deliveries, deliveryAttempts, events } from "../../src/db/schema.js";
 import {
@@ -18,6 +22,7 @@ import {
   processDelivery,
   type DeliveryWorkerResources,
 } from "../../src/worker/delivery-worker.js";
+import { createWebhookSignature } from "../../src/signing/webhook-signature.js";
 
 const adminDatabaseUrl =
   process.env.HOOKRELAY_TEST_ADMIN_DATABASE_URL ??
@@ -121,6 +126,8 @@ describe("Task 3 BullMQ delivery pipeline", () => {
   let receiverUrl: string;
   let receiverStatus = 204;
   let receivedBodies: unknown[] = [];
+  let demoReceiver: DemoReceiverResources;
+  let demoReceiverUrl: string;
   let app: FastifyInstance | undefined;
   let queue: DeliveryQueueResources | undefined;
   let worker: DeliveryWorkerResources | undefined;
@@ -149,6 +156,15 @@ describe("Task 3 BullMQ delivery pipeline", () => {
       throw new Error("HTTP test receiver did not expose an address.");
     }
     receiverUrl = `http://127.0.0.1:${address.port}/webhook`;
+
+    demoReceiver = createDemoReceiver({
+      secret: "task4-demo-secret",
+      maxAgeSeconds: 300,
+    });
+    demoReceiverUrl = await demoReceiver.app.listen({
+      port: 0,
+      host: "127.0.0.1",
+    });
   }, 15_000);
 
   beforeEach(async () => {
@@ -173,6 +189,7 @@ describe("Task 3 BullMQ delivery pipeline", () => {
 
   afterAll(async () => {
     await new Promise<void>((resolveClose) => receiver.close(() => resolveClose()));
+    await demoReceiver.app.close();
     await database.client.end({ timeout: 5 });
   });
 
@@ -191,14 +208,16 @@ describe("Task 3 BullMQ delivery pipeline", () => {
     });
   }
 
-  async function createEndpoint(): Promise<string> {
+  async function createEndpoint(
+    options: { url?: string; signingSecret?: string } = {},
+  ): Promise<string> {
     const response = await app?.inject({
       method: "POST",
       url: "/endpoints",
       payload: {
         name: "Task 3 receiver",
-        url: receiverUrl,
-        signingSecret: "not-used-until-task-4",
+        url: options.url ?? receiverUrl,
+        signingSecret: options.signingSecret ?? "task3-receiver-secret",
       },
     });
     expect(response?.statusCode).toBe(201);
@@ -359,5 +378,105 @@ describe("Task 3 BullMQ delivery pipeline", () => {
     expect(attemptCount?.value).toBe(0);
     await new Promise((resolve) => setTimeout(resolve, 500));
     expect(receivedBodies).toHaveLength(1);
+  }, 15_000);
+
+  it("delivers a signed webhook end to end through the demo receiver", async () => {
+    await startRuntime();
+    const scenario = "task4-signed-success";
+    const endpointId = await createEndpoint({
+      url: `${demoReceiverUrl}/demo/webhook?scenario=${scenario}&fail_first=0`,
+      signingSecret: "task4-demo-secret",
+    });
+    const response = await ingest(endpointId, "task4-signed-success");
+    expect(response?.statusCode).toBe(201);
+    const accepted = response?.json();
+
+    const delivered = await waitFor(
+      () => readDelivery(accepted.delivery.id),
+      (value) => value?.status === "delivered",
+    );
+    const state = demoReceiver.getScenarioState(scenario);
+    expect(state?.validRequestCount).toBe(1);
+    expect(state?.lastRequest).toMatchObject({
+      eventId: accepted.event.id,
+      eventType: "order.created",
+      rawBody: '{"metadata":{"a":1,"b":2},"orderId":123}',
+      payload: { metadata: { a: 1, b: 2 }, orderId: 123 },
+    });
+    expect(state?.lastRequest.timestamp).toMatch(/^[0-9]+$/);
+    expect(delivered?.deliveredAt).toBeInstanceOf(Date);
+    expect(delivered?.attemptCount).toBe(0);
+
+    const [attemptCount] = await database.db
+      .select({ value: count() })
+      .from(deliveryAttempts);
+    expect(attemptCount?.value).toBe(0);
+  }, 15_000);
+
+  it("does not deliver when the endpoint signing secret is wrong", async () => {
+    await startRuntime();
+    const scenario = "task4-wrong-secret";
+    const endpointId = await createEndpoint({
+      url: `${demoReceiverUrl}/demo/webhook?scenario=${scenario}&fail_first=0`,
+      signingSecret: "wrong-endpoint-secret",
+    });
+    const response = await ingest(endpointId, "task4-wrong-secret");
+    expect(response?.statusCode).toBe(201);
+    const deliveryId = response?.json().delivery.id as string;
+
+    const failedJob = await waitFor(
+      () => queue!.queue.getJob(deliveryId),
+      async (job) => (job ? (await job.getState()) === "failed" : false),
+    );
+    expect(await failedJob?.getState()).toBe("failed");
+    expect(failedJob?.attemptsMade).toBe(1);
+    const delivery = await readDelivery(deliveryId);
+    expect(delivery?.status).toBe("queued");
+    expect(delivery?.deliveredAt).toBeNull();
+    expect(delivery?.attemptCount).toBe(0);
+    expect(demoReceiver.getScenarioState(scenario)).toBeUndefined();
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    expect(demoReceiver.getScenarioState(scenario)).toBeUndefined();
+
+    const [attemptCount] = await database.db
+      .select({ value: count() })
+      .from(deliveryAttempts);
+    expect(attemptCount?.value).toBe(0);
+  }, 15_000);
+
+  it("serves the controlled 500, 500, 200 boundary over real HTTP", async () => {
+    const scenario = "task4-controlled-http";
+    const rawBody = '{ "demo": true, "order": 123 }';
+    const timestamp = Math.floor(Date.now() / 1000).toString();
+    const headersFor = (secret: string) => ({
+      "content-type": "application/json",
+      "x-hookrelay-event-id": "00000000-0000-4000-8000-000000000004",
+      "x-hookrelay-event-type": "demo.controlled",
+      "x-hookrelay-timestamp": timestamp,
+      "x-hookrelay-signature": createWebhookSignature(secret, timestamp, rawBody),
+    });
+    const url = `${demoReceiverUrl}/demo/webhook?scenario=${scenario}&fail_first=2`;
+
+    const invalid = await fetch(url, {
+      method: "POST",
+      headers: headersFor("wrong-secret"),
+      body: rawBody,
+    });
+    const statuses: number[] = [];
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const response = await fetch(url, {
+        method: "POST",
+        headers: headersFor("task4-demo-secret"),
+        body: rawBody,
+      });
+      statuses.push(response.status);
+    }
+
+    expect(invalid.status).toBe(401);
+    expect(statuses).toEqual([500, 500, 200]);
+    expect(demoReceiver.getScenarioState(scenario)).toMatchObject({
+      validRequestCount: 3,
+      lastRequest: { rawBody },
+    });
   }, 15_000);
 });

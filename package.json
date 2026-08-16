@@ -8,6 +8,7 @@
   "scripts": {
     "dev:api": "npm run dev:api --workspace @hookrelay/backend",
     "dev:worker": "npm run dev:worker --workspace @hookrelay/backend",
+    "dev:receiver": "npm run dev:receiver --workspace @hookrelay/backend",
     "dev:web": "npm run dev --workspace @hookrelay/web",
     "build": "npm run build --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
