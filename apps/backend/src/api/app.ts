@@ -1,4 +1,6 @@
 import Fastify, { type FastifyInstance } from "fastify";
+import type { AppDatabase } from "../db/client.js";
+import { registerDomainRoutes } from "./domain-routes.js";
 
 export type DependencyChecks = {
   postgres: () => Promise<void>;
@@ -11,6 +13,7 @@ type DependencyStatus =
 
 export type BuildAppOptions = {
   dependencyChecks: DependencyChecks;
+  database?: AppDatabase;
   logger?: boolean;
 };
 
@@ -44,6 +47,33 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
     });
   });
 
+  if (options.database) {
+    registerDomainRoutes(app, options.database);
+  }
+
+  app.setErrorHandler((error, request, reply) => {
+    const statusCode =
+      typeof error === "object" && error !== null && "statusCode" in error
+        ? error.statusCode
+        : undefined;
+
+    if (statusCode === 400) {
+      return reply.code(400).send({
+        error: {
+          code: "validation_error",
+          message: "Invalid request body.",
+        },
+      });
+    }
+
+    request.log.error({ error }, "Unhandled request error");
+    return reply.code(500).send({
+      error: {
+        code: "internal_error",
+        message: "An internal error occurred.",
+      },
+    });
+  });
+
   return app;
 }
-

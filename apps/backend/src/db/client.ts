@@ -6,6 +6,8 @@ export type DatabaseResources = {
   client: Sql;
 };
 
+export type AppDatabase = DatabaseResources["db"];
+
 export function createDatabase(databaseUrl: string): DatabaseResources {
   const client = postgres(databaseUrl, {
     max: 10,
@@ -18,4 +20,3 @@ export function createDatabase(databaseUrl: string): DatabaseResources {
     db: drizzle(client),
   };
 }
-

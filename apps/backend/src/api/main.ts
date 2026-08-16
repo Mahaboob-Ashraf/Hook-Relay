@@ -10,6 +10,7 @@ const redis = createRedisClient(config.redisUrl);
 
 const app = buildApp({
   logger: true,
+  database: database.db,
   dependencyChecks: {
     postgres: () => checkDatabase(database),
     redis: () => checkRedis(redis),

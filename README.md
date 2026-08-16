@@ -242,7 +242,3 @@ Redis/BullMQ coordinates queued and delayed work.
 ## Project Status
 
 HookRelay is currently under active development.
-
-The repository will be updated with verified behavior, tests, failure demonstrations, architecture diagrams, and measured local performance as those capabilities are implemented.
-
-Performance or scale claims will only be added after measurement.
