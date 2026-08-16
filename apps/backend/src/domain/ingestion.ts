@@ -31,18 +31,18 @@ export class IdempotencyConflictError extends Error {
   }
 }
 
-function canonicalJson(value: JsonValue): string {
+export function serializeJsonDeterministically(value: JsonValue): string {
   if (value === null || typeof value !== "object") {
     return JSON.stringify(value);
   }
 
   if (Array.isArray(value)) {
-    return `[${value.map(canonicalJson).join(",")}]`;
+    return `[${value.map(serializeJsonDeterministically).join(",")}]`;
   }
 
   return `{${Object.keys(value)
     .sort()
-    .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key] as JsonValue)}`)
+    .map((key) => `${JSON.stringify(key)}:${serializeJsonDeterministically(value[key] as JsonValue)}`)
     .join(",")}}`;
 }
 
@@ -152,7 +152,8 @@ export async function ingestEvent(
     const sameRequest =
       existing.endpointId.toLowerCase() === input.endpointId.toLowerCase() &&
       existing.event.eventType === input.eventType &&
-      canonicalJson(existing.payload) === canonicalJson(input.payload);
+      serializeJsonDeterministically(existing.payload) ===
+        serializeJsonDeterministically(input.payload);
 
     if (!sameRequest) throw new IdempotencyConflictError();
 
@@ -160,4 +161,3 @@ export async function ingestEvent(
     return result;
   }
 }
-

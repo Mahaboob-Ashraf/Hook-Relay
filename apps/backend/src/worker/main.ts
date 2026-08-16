@@ -1,11 +1,14 @@
 import { loadConfig } from "../config.js";
 import { createDatabase } from "../db/client.js";
 import { checkDatabase } from "../db/health.js";
-import { checkRedis, closeRedis, createRedisClient } from "../redis/client.js";
+import {
+  createDeliveryWorker,
+  type DeliveryWorkerResources,
+} from "./delivery-worker.js";
 
 const config = loadConfig();
 const database = createDatabase(config.databaseUrl);
-const redis = createRedisClient(config.redisUrl);
+let deliveryWorker: DeliveryWorkerResources | undefined;
 
 let resolveTermination: (() => void) | undefined;
 const termination = new Promise<void>((resolve) => {
@@ -21,22 +24,12 @@ process.once("SIGINT", () => requestShutdown("SIGINT"));
 process.once("SIGTERM", () => requestShutdown("SIGTERM"));
 
 try {
-  const dependencyResults = await Promise.allSettled([
-    checkDatabase(database),
-    checkRedis(redis),
-  ]);
-  const failures = dependencyResults.flatMap((result, index) => {
-    if (result.status === "fulfilled") return [];
-    const dependency = index === 0 ? "PostgreSQL" : "Redis";
-    const message = result.reason instanceof Error
-      ? result.reason.message
-      : "Unknown dependency error";
-    return [`${dependency}: ${message}`];
+  await checkDatabase(database);
+  deliveryWorker = createDeliveryWorker(database.db, config.redisUrl);
+  deliveryWorker.worker.on("failed", (job, error) => {
+    console.error(`Delivery job ${job?.id ?? "unknown"} failed:`, error.message);
   });
-
-  if (failures.length > 0) {
-    throw new Error(`Worker dependencies unavailable: ${failures.join("; ")}`);
-  }
+  await deliveryWorker.worker.waitUntilReady();
 
   console.info("HookRelay worker is ready (PostgreSQL and Redis connected).");
   await termination;
@@ -44,9 +37,7 @@ try {
   console.error("Worker failed to start:", error);
   process.exitCode = 1;
 } finally {
-  await Promise.all([
-    database.client.end({ timeout: 5 }),
-    closeRedis(redis),
-  ]);
+  await deliveryWorker?.close();
+  await database.client.end({ timeout: 5 });
   console.info("Worker resources closed.");
 }

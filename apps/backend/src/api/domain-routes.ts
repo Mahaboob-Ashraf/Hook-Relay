@@ -7,6 +7,7 @@ import {
   IdempotencyConflictError,
   ingestEvent,
 } from "../domain/ingestion.js";
+import type { DeliveryScheduler } from "../queue/delivery-queue.js";
 
 const endpointBodySchema = z.object({
   name: z.string().trim().min(1),
@@ -46,7 +47,11 @@ function sendValidationError(
   });
 }
 
-export function registerDomainRoutes(app: FastifyInstance, db: AppDatabase): void {
+export function registerDomainRoutes(
+  app: FastifyInstance,
+  db: AppDatabase,
+  scheduler?: DeliveryScheduler,
+): void {
   app.post("/endpoints", async (request, reply) => {
     const parsed = endpointBodySchema.safeParse(request.body);
     if (!parsed.success) {
@@ -111,6 +116,28 @@ export function registerDomainRoutes(app: FastifyInstance, db: AppDatabase): voi
         ...bodyResult.data,
         idempotencyKey: keyResult.data,
       });
+
+      if (scheduler) {
+        try {
+          await scheduler.scheduleDelivery(result.delivery.id);
+        } catch (error) {
+          request.log.warn(
+            { error, deliveryId: result.delivery.id },
+            "Durable delivery accepted but queue scheduling failed",
+          );
+          return reply.code(503).send({
+            error: {
+              code: "delivery_scheduling_unavailable",
+              message:
+                "Event and delivery were durably accepted, but scheduling failed. Retry this request with the same Idempotency-Key.",
+            },
+            durableAccepted: true,
+            scheduled: false,
+            ...result,
+          });
+        }
+      }
+
       return reply.code(result.reused ? 200 : 201).send(result);
     } catch (error) {
       if (error instanceof IdempotencyConflictError) {
@@ -126,4 +153,3 @@ export function registerDomainRoutes(app: FastifyInstance, db: AppDatabase): voi
     }
   });
 }
-

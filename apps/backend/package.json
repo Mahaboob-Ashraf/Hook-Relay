@@ -16,6 +16,7 @@
     "db:migrate": "tsx src/db/migrate.ts"
   },
   "dependencies": {
+    "bullmq": "^6.1.1",
     "dotenv": "^16.6.1",
     "drizzle-orm": "^0.45.2",
     "fastify": "^5.5.0",
