@@ -23,15 +23,19 @@ const metadataSchema = z.object({
   signature: z.string().min(1),
 });
 
+export type DemoRequest = {
+  eventId: string;
+  eventType: string;
+  timestamp: string;
+  rawBody: string;
+  payload: unknown;
+};
+
 export type DemoScenarioState = {
   validRequestCount: number;
-  lastRequest: {
-    eventId: string;
-    eventType: string;
-    timestamp: string;
-    rawBody: string;
-    payload: unknown;
-  };
+  lastRequest: DemoRequest;
+  requests: DemoRequest[];
+  responseStatuses: number[];
 };
 
 export type DemoReceiverResources = {
@@ -132,19 +136,23 @@ export function createDemoReceiver(
 
     const previous = scenarios.get(query.data.scenario);
     const receivedAttempt = (previous?.validRequestCount ?? 0) + 1;
+    const accepted = receivedAttempt > query.data.fail_first;
+    const responseStatus = accepted ? 200 : 500;
+    const validRequest: DemoRequest = {
+      eventId: metadata.data.eventId,
+      eventType: metadata.data.eventType,
+      timestamp: metadata.data.timestamp,
+      rawBody,
+      payload,
+    };
     scenarios.set(query.data.scenario, {
       validRequestCount: receivedAttempt,
-      lastRequest: {
-        eventId: metadata.data.eventId,
-        eventType: metadata.data.eventType,
-        timestamp: metadata.data.timestamp,
-        rawBody,
-        payload,
-      },
+      lastRequest: validRequest,
+      requests: [...(previous?.requests ?? []), validRequest],
+      responseStatuses: [...(previous?.responseStatuses ?? []), responseStatus],
     });
 
-    const accepted = receivedAttempt > query.data.fail_first;
-    return reply.code(accepted ? 200 : 500).send({
+    return reply.code(responseStatus).send({
       scenario: query.data.scenario,
       receivedAttempt,
       eventId: metadata.data.eventId,
@@ -173,4 +181,3 @@ export function createDemoReceiver(
     getScenarioState: (scenario) => scenarios.get(scenario),
   };
 }
-

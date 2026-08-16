@@ -134,7 +134,10 @@ describe("demo receiver", () => {
     }
 
     expect(statuses).toEqual([500, 500, 200]);
-    expect(demo.getScenarioState("controlled")?.validRequestCount).toBe(3);
+    expect(demo.getScenarioState("controlled")).toMatchObject({
+      validRequestCount: 3,
+      responseStatuses: [500, 500, 200],
+    });
   });
 
   it("does not let an invalid signature consume a controlled failure", async () => {
@@ -185,4 +188,3 @@ describe("demo receiver", () => {
     expect(demo.getScenarioState("reset-me")).toBeUndefined();
   });
 });
-

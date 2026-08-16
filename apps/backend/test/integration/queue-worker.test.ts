@@ -23,6 +23,10 @@ import {
   type DeliveryWorkerResources,
 } from "../../src/worker/delivery-worker.js";
 import { createWebhookSignature } from "../../src/signing/webhook-signature.js";
+import {
+  createDeliveryRetryPolicy,
+  type DeliveryRetryPolicy,
+} from "../../src/retry/delivery-retry-policy.js";
 
 const adminDatabaseUrl =
   process.env.HOOKRELAY_TEST_ADMIN_DATABASE_URL ??
@@ -120,12 +124,15 @@ class RedisTcpProxy {
   }
 }
 
-describe("Task 3 BullMQ delivery pipeline", () => {
+describe("Task 3-5 BullMQ delivery pipeline", () => {
   let database: DatabaseResources;
   let receiver: Server;
   let receiverUrl: string;
   let receiverStatus = 204;
+  let receiverStatusSequence: number[] = [];
+  let receiverResponseDelayMs = 0;
   let receivedBodies: unknown[] = [];
+  let receivedEventIds: string[] = [];
   let demoReceiver: DemoReceiverResources;
   let demoReceiverUrl: string;
   let app: FastifyInstance | undefined;
@@ -144,8 +151,18 @@ describe("Task 3 BullMQ delivery pipeline", () => {
       request.on("data", (chunk: Buffer) => chunks.push(chunk));
       request.on("end", () => {
         const body = Buffer.concat(chunks).toString("utf8");
+        const requestIndex = receivedBodies.length;
         receivedBodies.push(JSON.parse(body));
-        response.writeHead(receiverStatus).end();
+        receivedEventIds.push(String(request.headers["x-hookrelay-event-id"] ?? ""));
+        const status = receiverStatusSequence[requestIndex] ?? receiverStatus;
+        const sendResponse = () => {
+          if (!response.destroyed) response.writeHead(status).end();
+        };
+        if (receiverResponseDelayMs > 0) {
+          setTimeout(sendResponse, receiverResponseDelayMs);
+        } else {
+          sendResponse();
+        }
       });
     });
     await new Promise<void>((resolveListen) => {
@@ -169,7 +186,10 @@ describe("Task 3 BullMQ delivery pipeline", () => {
 
   beforeEach(async () => {
     receiverStatus = 204;
+    receiverStatusSequence = [];
+    receiverResponseDelayMs = 0;
     receivedBodies = [];
+    receivedEventIds = [];
     await database.client.unsafe(
       "truncate table delivery_attempts, deliveries, events, webhook_endpoints cascade",
     );
@@ -193,10 +213,20 @@ describe("Task 3 BullMQ delivery pipeline", () => {
     await database.client.end({ timeout: 5 });
   });
 
-  async function startRuntime(producerRedisUrl = redisUrl): Promise<void> {
-    queue = createDeliveryQueue(producerRedisUrl);
+  async function startRuntime(
+    options: {
+      producerRedisUrl?: string;
+      requestTimeoutMs?: number;
+      retryPolicy?: DeliveryRetryPolicy;
+    } = {},
+  ): Promise<void> {
+    queue = createDeliveryQueue(options.producerRedisUrl ?? redisUrl);
     await queue.queue.waitUntilReady();
-    worker = createDeliveryWorker(database.db, redisUrl);
+    worker = createDeliveryWorker(database.db, redisUrl, {
+      requestTimeoutMs: options.requestTimeoutMs,
+      retryPolicy:
+        options.retryPolicy ?? createDeliveryRetryPolicy([20, 20, 20, 20]),
+    });
     await worker.worker.waitUntilReady();
     app = buildApp({
       database: database.db,
@@ -312,7 +342,7 @@ describe("Task 3 BullMQ delivery pipeline", () => {
     const proxy = new RedisTcpProxy();
     await proxy.start();
     try {
-      await startRuntime(proxy.url);
+      await startRuntime({ producerRedisUrl: proxy.url });
       const endpointId = await createEndpoint();
       await proxy.stop();
 
@@ -352,11 +382,11 @@ describe("Task 3 BullMQ delivery pipeline", () => {
     }
   }, 20_000);
 
-  it("records a non-2xx job as failed without retries or attempt history", async () => {
+  it("exhausts an always-500 delivery after exactly five attempts", async () => {
     receiverStatus = 500;
     await startRuntime();
     const endpointId = await createEndpoint();
-    const response = await ingest(endpointId, "task3-http-failure");
+    const response = await ingest(endpointId, "task5-http-exhausted");
     expect(response?.statusCode).toBe(201);
     const deliveryId = response?.json().delivery.id as string;
 
@@ -365,19 +395,26 @@ describe("Task 3 BullMQ delivery pipeline", () => {
       async (job) => (job ? (await job.getState()) === "failed" : false),
     );
     expect(await failedJob?.getState()).toBe("failed");
-    expect(failedJob?.attemptsMade).toBe(1);
-    expect(failedJob?.opts.attempts).toBe(1);
+    expect(failedJob?.attemptsMade).toBe(5);
+    expect(failedJob?.opts.attempts).toBe(5);
+    expect(failedJob?.opts.backoff).toEqual({
+      type: "hookrelay-delivery-retry",
+    });
+    expect(failedJob?.id).toBe(deliveryId);
 
     const delivery = await readDelivery(deliveryId);
     expect(delivery?.status).toBe("queued");
     expect(delivery?.deliveredAt).toBeNull();
+    expect(delivery?.nextAttemptAt).toBeNull();
     expect(delivery?.attemptCount).toBe(0);
     const [attemptCount] = await database.db
       .select({ value: count() })
       .from(deliveryAttempts);
     expect(attemptCount?.value).toBe(0);
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    expect(receivedBodies).toHaveLength(1);
+    expect(receivedBodies).toHaveLength(5);
+    expect(new Set(receivedEventIds)).toEqual(new Set([response?.json().event.id]));
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(receivedBodies).toHaveLength(5);
   }, 15_000);
 
   it("delivers a signed webhook end to end through the demo receiver", async () => {
@@ -411,6 +448,165 @@ describe("Task 3 BullMQ delivery pipeline", () => {
       .select({ value: count() })
       .from(deliveryAttempts);
     expect(attemptCount?.value).toBe(0);
+  }, 15_000);
+
+  it("automatically retries signed 500, 500, 200 responses on one identity", async () => {
+    await startRuntime({
+      retryPolicy: createDeliveryRetryPolicy([1_050, 1_050, 20, 20]),
+    });
+    const scenario = "task5-signed-retry-success";
+    const endpointId = await createEndpoint({
+      url: `${demoReceiverUrl}/demo/webhook?scenario=${scenario}&fail_first=2`,
+      signingSecret: "task4-demo-secret",
+    });
+    const response = await ingest(endpointId, "task5-signed-retry-success");
+    expect(response?.statusCode).toBe(201);
+    const accepted = response?.json();
+
+    const delivered = await waitFor(
+      () => readDelivery(accepted.delivery.id),
+      (value) => value?.status === "delivered",
+    );
+    const state = demoReceiver.getScenarioState(scenario);
+    expect(state?.responseStatuses).toEqual([500, 500, 200]);
+    expect(state?.validRequestCount).toBe(3);
+    expect(state?.requests.map((request) => request.eventId)).toEqual([
+      accepted.event.id,
+      accepted.event.id,
+      accepted.event.id,
+    ]);
+    expect(state?.requests.map((request) => request.rawBody)).toEqual([
+      '{"metadata":{"a":1,"b":2},"orderId":123}',
+      '{"metadata":{"a":1,"b":2},"orderId":123}',
+      '{"metadata":{"a":1,"b":2},"orderId":123}',
+    ]);
+    expect(new Set(state?.requests.map((request) => request.timestamp)).size).toBe(3);
+    expect(delivered?.deliveredAt).toBeInstanceOf(Date);
+    expect(delivered?.nextAttemptAt).toBeNull();
+    expect(delivered?.attemptCount).toBe(0);
+
+    const job = await queue?.queue.getJob(accepted.delivery.id);
+    expect(job?.id).toBe(accepted.delivery.id);
+    expect(job?.attemptsMade).toBe(3);
+    expect(await job?.getState()).toBe("completed");
+
+    const [eventCount] = await database.db.select({ value: count() }).from(events);
+    const [deliveryCount] = await database.db.select({ value: count() }).from(deliveries);
+    const [attemptCount] = await database.db
+      .select({ value: count() })
+      .from(deliveryAttempts);
+    expect(eventCount?.value).toBe(1);
+    expect(deliveryCount?.value).toBe(1);
+    expect(attemptCount?.value).toBe(0);
+  }, 15_000);
+
+  it("persists retry_scheduled and the shared expected next-attempt delay", async () => {
+    const retryDelayMs = 600;
+    await startRuntime({
+      retryPolicy: createDeliveryRetryPolicy([retryDelayMs, 20, 20, 20]),
+    });
+    const scenario = "task5-visible-retry-state";
+    const endpointId = await createEndpoint({
+      url: `${demoReceiverUrl}/demo/webhook?scenario=${scenario}&fail_first=1`,
+      signingSecret: "task4-demo-secret",
+    });
+    const response = await ingest(endpointId, "task5-visible-retry-state");
+    const deliveryId = response?.json().delivery.id as string;
+
+    const retryScheduled = await waitFor(
+      () => readDelivery(deliveryId),
+      (value) => value?.status === "retry_scheduled",
+    );
+    expect(retryScheduled?.nextAttemptAt).toBeInstanceOf(Date);
+    const remainingDelayMs = retryScheduled!.nextAttemptAt!.getTime() - Date.now();
+    expect(remainingDelayMs).toBeGreaterThan(300);
+    expect(remainingDelayMs).toBeLessThanOrEqual(retryDelayMs + 100);
+    const delayedJob = await queue?.queue.getJob(deliveryId);
+    expect(await delayedJob?.getState()).toBe("delayed");
+
+    const delivered = await waitFor(
+      () => readDelivery(deliveryId),
+      (value) => value?.status === "delivered",
+    );
+    expect(delivered?.nextAttemptAt).toBeNull();
+    expect(demoReceiver.getScenarioState(scenario)?.responseStatuses).toEqual([
+      500,
+      200,
+    ]);
+  }, 15_000);
+
+  it("fails an HTTP 400 terminal response without consuming retries", async () => {
+    receiverStatus = 400;
+    await startRuntime();
+    const endpointId = await createEndpoint();
+    const response = await ingest(endpointId, "task5-terminal-400");
+    const deliveryId = response?.json().delivery.id as string;
+
+    const failedJob = await waitFor(
+      () => queue!.queue.getJob(deliveryId),
+      async (job) => (job ? (await job.getState()) === "failed" : false),
+    );
+    expect(failedJob?.attemptsMade).toBe(1);
+    expect(failedJob?.opts.attempts).toBe(5);
+    const delivery = await readDelivery(deliveryId);
+    expect(delivery?.status).toBe("queued");
+    expect(delivery?.deliveredAt).toBeNull();
+    expect(delivery?.nextAttemptAt).toBeNull();
+    expect(delivery?.attemptCount).toBe(0);
+    const [attemptCount] = await database.db
+      .select({ value: count() })
+      .from(deliveryAttempts);
+    expect(attemptCount?.value).toBe(0);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(receivedBodies).toHaveLength(1);
+  }, 15_000);
+
+  it("retries HTTP 429 once and then delivers on HTTP 200", async () => {
+    receiverStatusSequence = [429, 200];
+    await startRuntime();
+    const endpointId = await createEndpoint();
+    const response = await ingest(endpointId, "task5-retry-429");
+    const accepted = response?.json();
+
+    const delivered = await waitFor(
+      () => readDelivery(accepted.delivery.id),
+      (value) => value?.status === "delivered",
+    );
+    expect(receivedBodies).toHaveLength(2);
+    expect(receivedEventIds).toEqual([accepted.event.id, accepted.event.id]);
+    expect(delivered?.nextAttemptAt).toBeNull();
+    const job = await queue?.queue.getJob(accepted.delivery.id);
+    expect(job?.attemptsMade).toBe(2);
+    expect(await job?.getState()).toBe("completed");
+  }, 15_000);
+
+  it("aborts slow requests and exhausts timeout retries at five attempts", async () => {
+    receiverResponseDelayMs = 100;
+    await startRuntime({
+      requestTimeoutMs: 15,
+      retryPolicy: createDeliveryRetryPolicy([10, 10, 10, 10]),
+    });
+    const endpointId = await createEndpoint();
+    const response = await ingest(endpointId, "task5-timeout-exhausted");
+    const deliveryId = response?.json().delivery.id as string;
+
+    const failedJob = await waitFor(
+      () => queue!.queue.getJob(deliveryId),
+      async (job) => (job ? (await job.getState()) === "failed" : false),
+    );
+    expect(failedJob?.attemptsMade).toBe(5);
+    expect(receivedBodies).toHaveLength(5);
+    const delivery = await readDelivery(deliveryId);
+    expect(delivery?.status).toBe("queued");
+    expect(delivery?.deliveredAt).toBeNull();
+    expect(delivery?.nextAttemptAt).toBeNull();
+    expect(delivery?.attemptCount).toBe(0);
+    const [attemptCount] = await database.db
+      .select({ value: count() })
+      .from(deliveryAttempts);
+    expect(attemptCount?.value).toBe(0);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(receivedBodies).toHaveLength(5);
   }, 15_000);
 
   it("does not deliver when the endpoint signing secret is wrong", async () => {

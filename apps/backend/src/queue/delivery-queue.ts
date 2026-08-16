@@ -4,9 +4,11 @@ import {
   createBullProducerRedisClient,
   type RedisClient,
 } from "../redis/client.js";
+import { MAX_DELIVERY_ATTEMPTS } from "../retry/delivery-retry-policy.js";
 
 export const DELIVERY_QUEUE_NAME = "hookrelay-deliveries";
 export const DELIVERY_JOB_NAME = "deliver-webhook";
+export const DELIVERY_BACKOFF_STRATEGY = "hookrelay-delivery-retry";
 const PRODUCER_OPERATION_TIMEOUT_MS = 3_000;
 
 export type DeliveryJobData = {
@@ -37,7 +39,8 @@ export function createDeliveryQueue(redisUrl: string): DeliveryQueueResources {
         { deliveryId },
         {
           jobId: deliveryId,
-          attempts: 1,
+          attempts: MAX_DELIVERY_ATTEMPTS,
+          backoff: { type: DELIVERY_BACKOFF_STRATEGY },
           removeOnComplete: false,
           removeOnFail: false,
         },
