@@ -9,7 +9,12 @@ import {
   createDatabase,
   type DatabaseResources,
 } from "../../src/db/client.js";
-import { deliveries, events } from "../../src/db/schema.js";
+import {
+  deliveries,
+  deliveryAttempts,
+  events,
+  webhookEndpoints,
+} from "../../src/db/schema.js";
 
 const adminDatabaseUrl =
   process.env.HOOKRELAY_TEST_ADMIN_DATABASE_URL ??
@@ -103,6 +108,141 @@ describe("Task 2 domain API with PostgreSQL", () => {
         ...overrides,
       },
     });
+  }
+
+  async function createDeliveryReadFixture() {
+    const endpointId = "00000000-0000-4000-8000-000000000811";
+    const otherEndpointId = "00000000-0000-4000-8000-000000000812";
+    const eventId = "00000000-0000-4000-8000-000000000821";
+    const otherEventId = "00000000-0000-4000-8000-000000000822";
+    const deliveryIds = {
+      source: "00000000-0000-4000-8000-000000000801",
+      replay: "00000000-0000-4000-8000-000000000802",
+      branch: "00000000-0000-4000-8000-000000000803",
+      child: "00000000-0000-4000-8000-000000000804",
+      otherEvent: "00000000-0000-4000-8000-000000000805",
+      otherEndpoint: "00000000-0000-4000-8000-000000000806",
+    };
+
+    await database.db.insert(webhookEndpoints).values([
+      {
+        id: endpointId,
+        name: "Warehouse relay",
+        url: "https://warehouse.example.test/webhook",
+        signingSecret: "task8-signing-secret-never-expose",
+      },
+      {
+        id: otherEndpointId,
+        name: "Billing relay",
+        url: "https://billing.example.test/webhook",
+        signingSecret: "task8-other-signing-secret-never-expose",
+      },
+    ]);
+    await database.db.insert(events).values([
+      {
+        id: eventId,
+        eventType: "order.created",
+        payload: {
+          orderId: 314,
+          lineItems: [{ sku: "HOOK-8", quantity: 2 }],
+        },
+        idempotencyKey: "task8-ingestion-key-never-expose",
+        createdAt: new Date("2026-02-01T09:00:00.000Z"),
+      },
+      {
+        id: otherEventId,
+        eventType: "inventory.adjusted",
+        payload: { sku: "HOOK-8", delta: -2 },
+        idempotencyKey: "task8-other-ingestion-key-never-expose",
+        createdAt: new Date("2026-02-01T09:01:00.000Z"),
+      },
+    ]);
+
+    await database.db.insert(deliveries).values({
+      id: deliveryIds.source,
+      eventId,
+      endpointId,
+      status: "dead_letter",
+      attemptCount: 5,
+      createdAt: new Date("2026-02-01T10:00:00.000Z"),
+    });
+    await database.db.insert(deliveries).values([
+      {
+        id: deliveryIds.replay,
+        eventId,
+        endpointId,
+        status: "dead_letter",
+        attemptCount: 3,
+        replayedFromDeliveryId: deliveryIds.source,
+        replayIdempotencyKey: "task8-replay-key-never-expose",
+        createdAt: new Date("2026-02-03T10:00:00.000Z"),
+      },
+      {
+        id: deliveryIds.branch,
+        eventId,
+        endpointId,
+        status: "delivered",
+        attemptCount: 1,
+        deliveredAt: new Date("2026-02-03T10:10:00.000Z"),
+        replayedFromDeliveryId: deliveryIds.source,
+        replayIdempotencyKey: "task8-branch-key-never-expose",
+        createdAt: new Date("2026-02-03T10:00:00.000Z"),
+      },
+      {
+        id: deliveryIds.otherEvent,
+        eventId: otherEventId,
+        endpointId,
+        status: "delivering",
+        attemptCount: 1,
+        createdAt: new Date("2026-02-05T10:00:00.000Z"),
+      },
+      {
+        id: deliveryIds.otherEndpoint,
+        eventId,
+        endpointId: otherEndpointId,
+        status: "delivered",
+        attemptCount: 1,
+        deliveredAt: new Date("2026-02-06T10:01:00.000Z"),
+        createdAt: new Date("2026-02-06T10:00:00.000Z"),
+      },
+    ]);
+    await database.db.insert(deliveries).values({
+      id: deliveryIds.child,
+      eventId,
+      endpointId,
+      status: "queued",
+      replayedFromDeliveryId: deliveryIds.replay,
+      replayIdempotencyKey: "task8-child-key-never-expose",
+      createdAt: new Date("2026-02-04T10:00:00.000Z"),
+    });
+
+    await database.db.insert(deliveryAttempts).values([
+      {
+        deliveryId: deliveryIds.replay,
+        attemptNumber: 3,
+        startedAt: new Date("2026-02-03T10:03:00.000Z"),
+        completedAt: new Date("2026-02-03T10:03:00.025Z"),
+        responseStatus: 400,
+        latencyMs: 25,
+        errorMessage: "HTTP 400",
+      },
+      {
+        deliveryId: deliveryIds.replay,
+        attemptNumber: 1,
+        startedAt: new Date("2026-02-03T10:01:00.000Z"),
+        completedAt: new Date("2026-02-03T10:01:00.018Z"),
+        responseStatus: 500,
+        latencyMs: 18,
+        errorMessage: "HTTP 500",
+      },
+      {
+        deliveryId: deliveryIds.replay,
+        attemptNumber: 2,
+        startedAt: new Date("2026-02-03T10:02:00.000Z"),
+      },
+    ]);
+
+    return { endpointId, eventId, deliveryIds };
   }
 
   it("creates and lists endpoints without exposing signing secrets", async () => {
@@ -313,5 +453,247 @@ describe("Task 2 domain API with PostgreSQL", () => {
         "drop function if exists hookrelay_test_reject_delivery()",
       );
     }
+  });
+
+  it("lists deliveries newest-first with deterministic pagination and a total", async () => {
+    const { deliveryIds } = await createDeliveryReadFixture();
+
+    const response = await app.inject({ method: "GET", url: "/deliveries" });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().page).toEqual({ limit: 50, offset: 0, total: 6 });
+    expect(response.json().deliveries.map((delivery: { id: string }) => delivery.id)).toEqual([
+      deliveryIds.otherEndpoint,
+      deliveryIds.otherEvent,
+      deliveryIds.child,
+      deliveryIds.branch,
+      deliveryIds.replay,
+      deliveryIds.source,
+    ]);
+
+    const page = await app.inject({
+      method: "GET",
+      url: "/deliveries?limit=2&offset=3",
+    });
+    expect(page.statusCode).toBe(200);
+    expect(page.json().page).toEqual({ limit: 2, offset: 3, total: 6 });
+    expect(page.json().deliveries.map((delivery: { id: string }) => delivery.id)).toEqual([
+      deliveryIds.branch,
+      deliveryIds.replay,
+    ]);
+  });
+
+  it("filters delivery status before counting and paginating", async () => {
+    const { deliveryIds } = await createDeliveryReadFixture();
+
+    const first = await app.inject({
+      method: "GET",
+      url: "/deliveries?status=delivered&limit=1",
+    });
+    expect(first.statusCode).toBe(200);
+    expect(first.json()).toMatchObject({
+      deliveries: [{ id: deliveryIds.otherEndpoint, status: "delivered" }],
+      page: { limit: 1, offset: 0, total: 2 },
+    });
+
+    const second = await app.inject({
+      method: "GET",
+      url: "/deliveries?status=delivered&limit=1&offset=1",
+    });
+    expect(second.statusCode).toBe(200);
+    expect(second.json()).toMatchObject({
+      deliveries: [{ id: deliveryIds.branch, status: "delivered" }],
+      page: { limit: 1, offset: 1, total: 2 },
+    });
+  });
+
+  it("validates delivery list filters and pagination bounds", async () => {
+    for (const query of [
+      "status=unknown",
+      "limit=0",
+      "limit=101",
+      "limit=1.5",
+      "limit=not-a-number",
+      "offset=-1",
+      "offset=1.5",
+      "offset=not-a-number",
+      "unexpected=value",
+    ]) {
+      const response = await app.inject({
+        method: "GET",
+        url: `/deliveries?${query}`,
+      });
+      expect(response.statusCode, query).toBe(400);
+      expect(response.json(), query).toMatchObject({
+        error: { code: "validation_error" },
+      });
+    }
+
+    const maximum = await app.inject({
+      method: "GET",
+      url: "/deliveries?limit=100&offset=0",
+    });
+    expect(maximum.statusCode).toBe(200);
+    expect(maximum.json().page).toEqual({ limit: 100, offset: 0, total: 0 });
+  });
+
+  it("returns explicit joined delivery fields without exposing secrets or keys", async () => {
+    const { endpointId, eventId, deliveryIds } = await createDeliveryReadFixture();
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/deliveries?status=dead_letter",
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().deliveries[0]).toEqual({
+      id: deliveryIds.replay,
+      status: "dead_letter",
+      attemptCount: 3,
+      nextAttemptAt: null,
+      deliveredAt: null,
+      replayedFromDeliveryId: deliveryIds.source,
+      createdAt: "2026-02-03T10:00:00.000Z",
+      event: {
+        id: eventId,
+        eventType: "order.created",
+        createdAt: "2026-02-01T09:00:00.000Z",
+      },
+      endpoint: {
+        id: endpointId,
+        name: "Warehouse relay",
+        url: "https://warehouse.example.test/webhook",
+      },
+    });
+
+    for (const forbidden of [
+      "task8-signing-secret-never-expose",
+      "task8-ingestion-key-never-expose",
+      "task8-replay-key-never-expose",
+      "signingSecret",
+      "idempotencyKey",
+      "replayIdempotencyKey",
+    ]) {
+      expect(response.body).not.toContain(forbidden);
+    }
+  });
+
+  it("returns ordered durable attempts and the branching replay graph", async () => {
+    const { endpointId, eventId, deliveryIds } = await createDeliveryReadFixture();
+
+    const response = await app.inject({
+      method: "GET",
+      url: `/deliveries/${deliveryIds.replay}`,
+    });
+    expect(response.statusCode).toBe(200);
+    const body = response.json();
+    expect(body.delivery).toEqual({
+      id: deliveryIds.replay,
+      status: "dead_letter",
+      attemptCount: 3,
+      nextAttemptAt: null,
+      deliveredAt: null,
+      replayedFromDeliveryId: deliveryIds.source,
+      createdAt: "2026-02-03T10:00:00.000Z",
+      event: {
+        id: eventId,
+        eventType: "order.created",
+        payload: {
+          orderId: 314,
+          lineItems: [{ sku: "HOOK-8", quantity: 2 }],
+        },
+        createdAt: "2026-02-01T09:00:00.000Z",
+      },
+      endpoint: {
+        id: endpointId,
+        name: "Warehouse relay",
+        url: "https://warehouse.example.test/webhook",
+      },
+    });
+    expect(body.attempts.map((attempt: { attemptNumber: number }) => attempt.attemptNumber)).toEqual([
+      1,
+      2,
+      3,
+    ]);
+    expect(body.attempts[0]).toMatchObject({
+      attemptNumber: 1,
+      completedAt: "2026-02-03T10:01:00.018Z",
+      responseStatus: 500,
+      latencyMs: 18,
+      errorMessage: "HTTP 500",
+    });
+    expect(body.attempts[1]).toMatchObject({
+      attemptNumber: 2,
+      startedAt: "2026-02-03T10:02:00.000Z",
+      completedAt: null,
+      responseStatus: null,
+      latencyMs: null,
+      errorMessage: null,
+    });
+    expect(body.attempts[2]).toMatchObject({
+      attemptNumber: 3,
+      responseStatus: 400,
+      errorMessage: "HTTP 400",
+    });
+    expect(body.relatedDeliveries).toEqual([
+      {
+        id: deliveryIds.source,
+        status: "dead_letter",
+        createdAt: "2026-02-01T10:00:00.000Z",
+        replayedFromDeliveryId: null,
+      },
+      {
+        id: deliveryIds.replay,
+        status: "dead_letter",
+        createdAt: "2026-02-03T10:00:00.000Z",
+        replayedFromDeliveryId: deliveryIds.source,
+      },
+      {
+        id: deliveryIds.branch,
+        status: "delivered",
+        createdAt: "2026-02-03T10:00:00.000Z",
+        replayedFromDeliveryId: deliveryIds.source,
+      },
+      {
+        id: deliveryIds.child,
+        status: "queued",
+        createdAt: "2026-02-04T10:00:00.000Z",
+        replayedFromDeliveryId: deliveryIds.replay,
+      },
+    ]);
+
+    for (const forbidden of [
+      "task8-signing-secret-never-expose",
+      "task8-ingestion-key-never-expose",
+      "task8-replay-key-never-expose",
+      "task8-branch-key-never-expose",
+      "task8-child-key-never-expose",
+      "signingSecret",
+      "idempotencyKey",
+      "replayIdempotencyKey",
+    ]) {
+      expect(response.body).not.toContain(forbidden);
+    }
+  });
+
+  it("returns validation and not-found errors for delivery detail lookup", async () => {
+    const invalid = await app.inject({
+      method: "GET",
+      url: "/deliveries/not-a-uuid",
+    });
+    expect(invalid.statusCode).toBe(400);
+    expect(invalid.json()).toMatchObject({
+      error: { code: "validation_error" },
+    });
+
+    const missing = await app.inject({
+      method: "GET",
+      url: "/deliveries/00000000-0000-4000-8000-000000000899",
+    });
+    expect(missing.statusCode).toBe(404);
+    expect(missing.json()).toEqual({
+      error: {
+        code: "delivery_not_found",
+        message: "Delivery was not found.",
+      },
+    });
   });
 });

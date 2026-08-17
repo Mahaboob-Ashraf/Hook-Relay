@@ -1,6 +1,7 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import type { AppDatabase } from "../db/client.js";
 import type { DeliveryScheduler } from "../queue/delivery-queue.js";
+import { registerDeliveryReadRoutes } from "./delivery-read-routes.js";
 import { registerDomainRoutes } from "./domain-routes.js";
 
 export type DependencyChecks = {
@@ -51,6 +52,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
 
   if (options.database) {
     registerDomainRoutes(app, options.database, options.deliveryScheduler);
+    registerDeliveryReadRoutes(app, options.database);
   }
 
   app.setErrorHandler((error, request, reply) => {
