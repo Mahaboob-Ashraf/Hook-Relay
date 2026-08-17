@@ -696,4 +696,244 @@ describe("Task 2 domain API with PostgreSQL", () => {
       },
     });
   });
+
+  it("returns explicit zero and null metrics for an empty database", async () => {
+    const response = await app.inject({ method: "GET", url: "/metrics" });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      generatedAt: expect.any(String),
+      source: "postgresql",
+      deliveries: {
+        total: 0,
+        byStatus: {
+          queued: 0,
+          delivering: 0,
+          retryScheduled: 0,
+          delivered: 0,
+          deadLetter: 0,
+        },
+        terminal: 0,
+        terminalSuccessRate: null,
+      },
+      attempts: {
+        total: 0,
+        completed: 0,
+        incomplete: 0,
+        retryAttempts: 0,
+        latencyMs: {
+          sampleCount: 0,
+          average: null,
+          p50: null,
+          p95: null,
+          max: null,
+        },
+      },
+    });
+    expect(Number.isNaN(Date.parse(response.json().generatedAt))).toBe(false);
+  });
+
+  it("calculates every status, attempt, success-rate, and latency aggregate from one durable fixture", async () => {
+    const endpointId = "00000000-0000-4000-8000-000000000910";
+    const eventIds = [
+      "00000000-0000-4000-8000-000000000920",
+      "00000000-0000-4000-8000-000000000921",
+      "00000000-0000-4000-8000-000000000922",
+      "00000000-0000-4000-8000-000000000923",
+      "00000000-0000-4000-8000-000000000924",
+      "00000000-0000-4000-8000-000000000925",
+    ] as const;
+    const deliveryIds = [
+      "00000000-0000-4000-8000-000000000930",
+      "00000000-0000-4000-8000-000000000931",
+      "00000000-0000-4000-8000-000000000932",
+      "00000000-0000-4000-8000-000000000933",
+      "00000000-0000-4000-8000-000000000934",
+      "00000000-0000-4000-8000-000000000935",
+    ] as const;
+    await database.db.insert(webhookEndpoints).values({
+      id: endpointId,
+      name: "Metrics receiver",
+      url: "https://metrics.example.test/webhook",
+      signingSecret: "task9-metrics-signing-secret-never-expose",
+    });
+    await database.db.insert(events).values(
+      eventIds.map((id, index) => ({
+        id,
+        eventType: `metrics.fixture.${index}`,
+        payload: { fixture: index },
+        idempotencyKey: `task9-metrics-ingestion-key-${index}-never-expose`,
+      })),
+    );
+    await database.db.insert(deliveries).values([
+      { id: deliveryIds[0], eventId: eventIds[0], endpointId, status: "queued" },
+      {
+        id: deliveryIds[1],
+        eventId: eventIds[1],
+        endpointId,
+        status: "delivering",
+        attemptCount: 1,
+      },
+      {
+        id: deliveryIds[2],
+        eventId: eventIds[2],
+        endpointId,
+        status: "retry_scheduled",
+        attemptCount: 2,
+        nextAttemptAt: new Date("2026-08-17T12:00:30.000Z"),
+      },
+      {
+        id: deliveryIds[3],
+        eventId: eventIds[3],
+        endpointId,
+        status: "delivered",
+        attemptCount: 2,
+        deliveredAt: new Date("2026-08-17T12:00:00.000Z"),
+      },
+      {
+        id: deliveryIds[4],
+        eventId: eventIds[4],
+        endpointId,
+        status: "delivered",
+        attemptCount: 1,
+        deliveredAt: new Date("2026-08-17T12:00:00.000Z"),
+      },
+      {
+        id: deliveryIds[5],
+        eventId: eventIds[5],
+        endpointId,
+        status: "dead_letter",
+        replayIdempotencyKey: "task9-metrics-replay-key-never-expose",
+      },
+    ]);
+    const completedAt = new Date("2026-08-17T12:00:00.000Z");
+    await database.db.insert(deliveryAttempts).values([
+      {
+        deliveryId: deliveryIds[1],
+        attemptNumber: 1,
+        startedAt: new Date("2026-08-17T11:59:59.900Z"),
+      },
+      {
+        deliveryId: deliveryIds[2],
+        attemptNumber: 1,
+        completedAt,
+        responseStatus: 500,
+        latencyMs: 10,
+        errorMessage: "HTTP 500",
+      },
+      {
+        deliveryId: deliveryIds[2],
+        attemptNumber: 2,
+        completedAt,
+        responseStatus: 500,
+        latencyMs: 20,
+        errorMessage: "HTTP 500",
+      },
+      {
+        deliveryId: deliveryIds[3],
+        attemptNumber: 1,
+        completedAt,
+        responseStatus: 500,
+        latencyMs: 30,
+        errorMessage: "HTTP 500",
+      },
+      {
+        deliveryId: deliveryIds[3],
+        attemptNumber: 2,
+        completedAt,
+        responseStatus: 200,
+        latencyMs: 40,
+      },
+      {
+        deliveryId: deliveryIds[4],
+        attemptNumber: 1,
+        completedAt,
+        responseStatus: 200,
+        latencyMs: 100,
+      },
+    ]);
+
+    const before = {
+      deliveries: (await database.db.select({ value: count() }).from(deliveries))[0]?.value,
+      attempts: (await database.db.select({ value: count() }).from(deliveryAttempts))[0]?.value,
+    };
+    const first = await app.inject({ method: "GET", url: "/metrics" });
+    const second = await app.inject({ method: "GET", url: "/metrics" });
+    const after = {
+      deliveries: (await database.db.select({ value: count() }).from(deliveries))[0]?.value,
+      attempts: (await database.db.select({ value: count() }).from(deliveryAttempts))[0]?.value,
+    };
+
+    expect(first.statusCode).toBe(200);
+    expect(first.json()).toMatchObject({
+      source: "postgresql",
+      deliveries: {
+        total: 6,
+        byStatus: {
+          queued: 1,
+          delivering: 1,
+          retryScheduled: 1,
+          delivered: 2,
+          deadLetter: 1,
+        },
+        terminal: 3,
+      },
+      attempts: {
+        total: 6,
+        completed: 5,
+        incomplete: 1,
+        retryAttempts: 2,
+        latencyMs: {
+          sampleCount: 5,
+          average: 40,
+          p50: 30,
+          p95: 100,
+          max: 100,
+        },
+      },
+    });
+    expect(first.json().deliveries.terminalSuccessRate).toBeCloseTo(2 / 3, 12);
+    expect(second.json()).toMatchObject({
+      deliveries: first.json().deliveries,
+      attempts: first.json().attempts,
+    });
+    expect(after).toEqual(before);
+    for (const forbidden of [
+      "task9-metrics-signing-secret-never-expose",
+      "task9-metrics-ingestion-key",
+      "task9-metrics-replay-key-never-expose",
+      "signingSecret",
+      "idempotencyKey",
+      "replayIdempotencyKey",
+      "stack",
+    ]) {
+      expect(first.body).not.toContain(forbidden);
+    }
+  });
+
+  it("returns null terminal and latency values when active deliveries have no valid samples", async () => {
+    const endpoint = await createEndpoint();
+    const response = await ingest(endpoint.id, "task9-active-only");
+    expect(response.statusCode).toBe(201);
+
+    const metrics = await app.inject({ method: "GET", url: "/metrics" });
+    expect(metrics.statusCode).toBe(200);
+    expect(metrics.json()).toMatchObject({
+      deliveries: {
+        total: 1,
+        terminal: 0,
+        terminalSuccessRate: null,
+      },
+      attempts: {
+        total: 0,
+        latencyMs: {
+          sampleCount: 0,
+          average: null,
+          p50: null,
+          p95: null,
+          max: null,
+        },
+      },
+    });
+  });
 });

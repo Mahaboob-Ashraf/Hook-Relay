@@ -1,4 +1,4 @@
-import { and, asc, eq, isNull } from "drizzle-orm";
+import { and, asc, eq, isNull, sql } from "drizzle-orm";
 import type { AppDatabase } from "../db/client.js";
 import { deliveries, events, type JsonValue } from "../db/schema.js";
 
@@ -117,6 +117,7 @@ export async function ingestEvent(
           eventType: input.eventType,
           payload: input.payload,
           idempotencyKey: input.idempotencyKey,
+          createdAt: sql<Date>`clock_timestamp()`,
         })
         .returning({
           id: events.id,
@@ -131,6 +132,7 @@ export async function ingestEvent(
         .values({
           eventId: event.id,
           endpointId: input.endpointId,
+          createdAt: sql<Date>`clock_timestamp()`,
         })
         .returning({
           id: deliveries.id,

@@ -1,0 +1,282 @@
+{
+  "label": "Local development benchmark — not a production capacity claim",
+  "generatedAt": "2026-08-17T07:01:48.950Z",
+  "runId": "task9-20260817070117-dc2100e1",
+  "metadata": {
+    "commitHash": "243d3c8185b46442084c3cc2e4c4037c86240d27",
+    "dirtyWorkingTree": true,
+    "nodeVersion": "v22.17.1",
+    "operatingSystem": {
+      "platform": "win32",
+      "release": "10.0.26200",
+      "architecture": "x64"
+    },
+    "cpu": {
+      "model": "AMD Ryzen 5 5600X 6-Core Processor             ",
+      "logicalCpuCount": 12
+    },
+    "totalMemoryBytes": 17100427264,
+    "postgresVersion": "17.11",
+    "redisVersion": "7.4.10",
+    "retryPolicy": {
+      "maxAttempts": 5,
+      "retryDelaysMs": [
+        5000,
+        15000,
+        45000,
+        120000
+      ]
+    }
+  },
+  "configuration": {
+    "warmupEvents": 25,
+    "measuredEventsPerRun": 500,
+    "ingestionConcurrency": 25,
+    "measuredRuns": 3,
+    "ingestionIdempotencyConcurrency": 25,
+    "replayIdempotencyConcurrency": 25,
+    "timeoutMs": 120000,
+    "clockStabilityGate": {
+      "maximumSampleDriftMs": 250,
+      "requiredConsecutiveSamples": 10,
+      "checks": [
+        {
+          "checkpoint": "before-warmup",
+          "absoluteOffsetMs": 80826.565,
+          "sampleDriftMs": 0.349,
+          "consecutiveSamples": 10
+        },
+        {
+          "checkpoint": "before-measured-1",
+          "absoluteOffsetMs": 80826.636,
+          "sampleDriftMs": 0.042,
+          "consecutiveSamples": 10
+        },
+        {
+          "checkpoint": "before-measured-2",
+          "absoluteOffsetMs": 80826.59,
+          "sampleDriftMs": 0.105,
+          "consecutiveSamples": 10
+        },
+        {
+          "checkpoint": "before-measured-3",
+          "absoluteOffsetMs": 80826.306,
+          "sampleDriftMs": 0.743,
+          "consecutiveSamples": 10
+        }
+      ]
+    },
+    "percentileMethod": "Nearest-rank: sort ascending and select value at ceil(percentile * sampleCount), using one-based rank.",
+    "persistedEndToEndLatencyDefinition": "deliveries.created_at through deliveries.delivered_at for each measured initial delivery",
+    "ingestionLatencyDefinition": "client monotonic time from starting POST /events through receiving and parsing its JSON response"
+  },
+  "warmup": {
+    "configuredEventCount": 25,
+    "acceptedEventCount": 25,
+    "deliveredEventCount": 25,
+    "totalDurationMs": 538.906
+  },
+  "measuredRuns": [
+    {
+      "runNumber": 1,
+      "eventType": "hookrelay.benchmark.task9-20260817070117-dc2100e1.measured-1",
+      "configuredEventCount": 500,
+      "acceptedEventCount": 500,
+      "deliveredEventCount": 500,
+      "failedOrNonDeliveredCount": 0,
+      "terminalSuccessRate": 1,
+      "ingestionDurationMs": 1171.821,
+      "totalDurationMs": 7039.959,
+      "ingestionThroughputEventsPerSecond": 426.686,
+      "deliveryThroughputDeliveriesPerSecond": 71.023,
+      "clientObservedIngestionLatencyMs": {
+        "sampleCount": 500,
+        "average": 57.721,
+        "p50": 57.302,
+        "p95": 69.972,
+        "min": 29.974,
+        "max": 80.401
+      },
+      "persistedEndToEndDeliveryLatencyMs": {
+        "sampleCount": 500,
+        "average": 3416.737,
+        "p50": 3419.65,
+        "p95": 5586.732,
+        "min": 100.901,
+        "max": 5837.672
+      },
+      "databaseVerification": {
+        "eventCount": 500,
+        "initialDeliveryCount": 500,
+        "attemptCount": 500,
+        "firstAttemptCount": 500
+      }
+    },
+    {
+      "runNumber": 2,
+      "eventType": "hookrelay.benchmark.task9-20260817070117-dc2100e1.measured-2",
+      "configuredEventCount": 500,
+      "acceptedEventCount": 500,
+      "deliveredEventCount": 500,
+      "failedOrNonDeliveredCount": 0,
+      "terminalSuccessRate": 1,
+      "ingestionDurationMs": 867.724,
+      "totalDurationMs": 6371.481,
+      "ingestionThroughputEventsPerSecond": 576.22,
+      "deliveryThroughputDeliveriesPerSecond": 78.475,
+      "clientObservedIngestionLatencyMs": {
+        "sampleCount": 500,
+        "average": 42.702,
+        "p50": 42.712,
+        "p95": 48.472,
+        "min": 22.526,
+        "max": 56.624
+      },
+      "persistedEndToEndDeliveryLatencyMs": {
+        "sampleCount": 500,
+        "average": 3096.309,
+        "p50": 3110.611,
+        "p95": 5227.661,
+        "min": 74.944,
+        "max": 5475.394
+      },
+      "databaseVerification": {
+        "eventCount": 500,
+        "initialDeliveryCount": 500,
+        "attemptCount": 500,
+        "firstAttemptCount": 500
+      }
+    },
+    {
+      "runNumber": 3,
+      "eventType": "hookrelay.benchmark.task9-20260817070117-dc2100e1.measured-3",
+      "configuredEventCount": 500,
+      "acceptedEventCount": 500,
+      "deliveredEventCount": 500,
+      "failedOrNonDeliveredCount": 0,
+      "terminalSuccessRate": 1,
+      "ingestionDurationMs": 833.866,
+      "totalDurationMs": 6358.409,
+      "ingestionThroughputEventsPerSecond": 599.617,
+      "deliveryThroughputDeliveriesPerSecond": 78.636,
+      "clientObservedIngestionLatencyMs": {
+        "sampleCount": 500,
+        "average": 41.03,
+        "p50": 40.834,
+        "p95": 48.69,
+        "min": 20.625,
+        "max": 58.631
+      },
+      "persistedEndToEndDeliveryLatencyMs": {
+        "sampleCount": 500,
+        "average": 2789.661,
+        "p50": 2775.851,
+        "p95": 4803.948,
+        "min": 72.628,
+        "max": 5043.534
+      },
+      "databaseVerification": {
+        "eventCount": 500,
+        "initialDeliveryCount": 500,
+        "attemptCount": 500,
+        "firstAttemptCount": 500
+      }
+    }
+  ],
+  "summary": {
+    "ingestionThroughputEventsPerSecond": {
+      "mean": 534.174,
+      "median": 576.22,
+      "min": 426.686,
+      "max": 599.617,
+      "standardDeviation": 76.604
+    },
+    "deliveryThroughputDeliveriesPerSecond": {
+      "mean": 76.045,
+      "median": 78.475,
+      "min": 71.023,
+      "max": 78.636,
+      "standardDeviation": 3.551
+    },
+    "clientObservedIngestionLatencyAverageMs": {
+      "mean": 47.151,
+      "median": 42.702,
+      "min": 41.03,
+      "max": 57.721,
+      "standardDeviation": 7.505
+    },
+    "clientObservedIngestionLatencyP50Ms": {
+      "mean": 46.949,
+      "median": 42.712,
+      "min": 40.834,
+      "max": 57.302,
+      "standardDeviation": 7.36
+    },
+    "clientObservedIngestionLatencyP95Ms": {
+      "mean": 55.711,
+      "median": 48.69,
+      "min": 48.472,
+      "max": 69.972,
+      "standardDeviation": 10.084
+    },
+    "persistedEndToEndLatencyAverageMs": {
+      "mean": 3100.902,
+      "median": 3096.309,
+      "min": 2789.661,
+      "max": 3416.737,
+      "standardDeviation": 256.023
+    },
+    "persistedEndToEndLatencyP50Ms": {
+      "mean": 3102.037,
+      "median": 3110.611,
+      "min": 2775.851,
+      "max": 3419.65,
+      "standardDeviation": 262.9
+    },
+    "persistedEndToEndLatencyP95Ms": {
+      "mean": 5206.114,
+      "median": 5227.661,
+      "min": 4803.948,
+      "max": 5586.732,
+      "standardDeviation": 319.933
+    },
+    "totalDurationMs": {
+      "mean": 6589.95,
+      "median": 6371.481,
+      "min": 6358.409,
+      "max": 7039.959,
+      "standardDeviation": 318.249
+    }
+  },
+  "concurrencyCorrectness": {
+    "ingestion": {
+      "concurrency": 25,
+      "responseCount": 25,
+      "uniqueEventIds": 1,
+      "uniqueDeliveryIds": 1,
+      "postgresql": {
+        "eventRows": 1,
+        "initialDeliveryRows": 1
+      }
+    },
+    "replay": {
+      "concurrency": 25,
+      "responseCount": 25,
+      "uniqueReplayDeliveryIds": 1,
+      "postgresql": {
+        "replayDeliveryRows": 1,
+        "sourceStatus": "dead_letter",
+        "sourceUnchanged": true
+      }
+    },
+    "interpretation": "These checks prove idempotency correctness under bounded concurrency, not throughput capacity."
+  },
+  "limitations": [
+    "Local single-machine development measurement; not a production capacity claim.",
+    "One API process, one BullMQ worker, one PostgreSQL instance, and one Redis instance.",
+    "Immediate local HTTP 200 receiver with no network distance or production contention.",
+    "HookRelay remains at-least-once; a crash after receiver processing and before durable finalization can duplicate delivery.",
+    "PostgreSQL-first scheduling retains a PostgreSQL/Redis dual-write gap and requires client idempotent retry; no outbox or autonomous reconciliation exists.",
+    "No multi-region or high-availability guarantee is measured."
+  ]
+}

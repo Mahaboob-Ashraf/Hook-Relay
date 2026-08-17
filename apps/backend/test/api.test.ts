@@ -45,12 +45,20 @@ describe("health routes", () => {
     });
   });
 
-  it("returns 503 and identifies an unavailable dependency", async () => {
+  it("reports dependencies independently, sanitizes failures, and recovers in the same process", async () => {
+    let postgresReady = false;
+    let redisReady = false;
     const app = buildApp({
       dependencyChecks: {
-        postgres: async () => undefined,
+        postgres: async () => {
+          if (!postgresReady) {
+            throw new Error("postgresql://user:secret@private.internal/hookrelay");
+          }
+        },
         redis: async () => {
-          throw new Error("Redis unavailable");
+          if (!redisReady) {
+            throw new Error("redis://:secret@private.internal:6379");
+          }
         },
       },
     });
@@ -62,10 +70,33 @@ describe("health routes", () => {
     expect(response.json()).toEqual({
       status: "not_ready",
       dependencies: {
+        postgres: { status: "down", error: "Dependency check failed." },
+        redis: { status: "down", error: "Dependency check failed." },
+      },
+    });
+    expect(response.body).not.toContain("secret");
+    expect(response.body).not.toContain("private.internal");
+
+    postgresReady = true;
+    const partiallyReady = await app.inject({ method: "GET", url: "/health/ready" });
+    expect(partiallyReady.statusCode).toBe(503);
+    expect(partiallyReady.json()).toEqual({
+      status: "not_ready",
+      dependencies: {
         postgres: { status: "up" },
-        redis: { status: "down", error: "Redis unavailable" },
+        redis: { status: "down", error: "Dependency check failed." },
+      },
+    });
+
+    redisReady = true;
+    const recovered = await app.inject({ method: "GET", url: "/health/ready" });
+    expect(recovered.statusCode).toBe(200);
+    expect(recovered.json()).toEqual({
+      status: "ready",
+      dependencies: {
+        postgres: { status: "up" },
+        redis: { status: "up" },
       },
     });
   });
 });
-

@@ -44,6 +44,17 @@ export type DeliveryWorkerResources = {
 export type DeliveryWorkerOptions = {
   requestTimeoutMs?: number | undefined;
   retryPolicy?: DeliveryRetryPolicy | undefined;
+  onAttemptResult?: ((event: DeliveryAttemptLogEvent) => void) | undefined;
+};
+
+export type DeliveryAttemptLogEvent = {
+  deliveryId: string;
+  eventId: string;
+  attemptNumber: number;
+  resultClassification: "success" | "retryable" | "terminal";
+  deliveryStatus: "retry_scheduled" | "delivered" | "dead_letter";
+  responseStatus: number | null;
+  latencyMs: number;
 };
 
 type ProcessDeliveryOptions = DeliveryWorkerOptions & {
@@ -68,19 +79,13 @@ function createFailureFinalization(
     result.classification === "retryable" && currentAttempt < totalAttempts
       ? getRetryDelayMs(currentAttempt, retryPolicy)
       : undefined;
-  const completedAt = new Date();
   return {
-    completedAt,
     responseStatus: result.responseStatus,
     latencyMs: result.latencyMs,
     errorMessage: result.errorMessage,
     deliveryStatus:
       retryDelayMs === undefined ? "dead_letter" : "retry_scheduled",
-    nextAttemptAt:
-      retryDelayMs === undefined
-        ? null
-        : new Date(completedAt.getTime() + retryDelayMs),
-    deliveredAt: null,
+    retryDelayMs: retryDelayMs ?? null,
   };
 }
 
@@ -91,17 +96,19 @@ async function persistFailure(
   currentAttempt: number,
   totalAttempts: number,
   retryPolicy: DeliveryRetryPolicy,
-): Promise<void> {
+): Promise<DeliveryAttemptFinalization> {
+  const finalization = createFailureFinalization(
+    result,
+    currentAttempt,
+    totalAttempts,
+    retryPolicy,
+  );
   await finalizeDeliveryAttempt(
     db,
     attempt,
-    createFailureFinalization(
-      result,
-      currentAttempt,
-      totalAttempts,
-      retryPolicy,
-    ),
+    finalization,
   );
+  return finalization;
 }
 
 async function sendWebhook(
@@ -209,7 +216,7 @@ export async function processDelivery(
             error,
           },
     );
-    await persistFailure(
+    const finalization = await persistFailure(
       db,
       attempt,
       result,
@@ -217,6 +224,15 @@ export async function processDelivery(
       totalAttempts,
       retryPolicy,
     );
+    options.onAttemptResult?.({
+      deliveryId: canonical.deliveryId,
+      eventId: canonical.eventId,
+      attemptNumber: attempt.attemptNumber,
+      resultClassification: result.classification,
+      deliveryStatus: finalization.deliveryStatus,
+      responseStatus: result.responseStatus,
+      latencyMs: result.latencyMs,
+    });
     const message = result.errorMessage ?? "Unknown delivery network error";
     throw new Error(`Delivery ${canonical.deliveryId} failed: ${message}`, {
       cause: error,
@@ -229,7 +245,7 @@ export async function processDelivery(
     elapsedMs: performance.now() - requestStartedAt,
   });
   if (result.classification !== "success") {
-    await persistFailure(
+    const finalization = await persistFailure(
       db,
       attempt,
       result,
@@ -237,6 +253,15 @@ export async function processDelivery(
       totalAttempts,
       retryPolicy,
     );
+    options.onAttemptResult?.({
+      deliveryId: canonical.deliveryId,
+      eventId: canonical.eventId,
+      attemptNumber: attempt.attemptNumber,
+      resultClassification: result.classification,
+      deliveryStatus: finalization.deliveryStatus,
+      responseStatus: result.responseStatus,
+      latencyMs: result.latencyMs,
+    });
     const message = `Delivery ${canonical.deliveryId} failed: ${result.errorMessage}.`;
     if (result.classification === "terminal") {
       throw new UnrecoverableError(message);
@@ -244,15 +269,21 @@ export async function processDelivery(
     throw new Error(message);
   }
 
-  const completedAt = new Date();
   await finalizeDeliveryAttempt(db, attempt, {
-    completedAt,
     responseStatus: result.responseStatus,
     latencyMs: result.latencyMs,
     errorMessage: result.errorMessage,
     deliveryStatus: "delivered",
-    deliveredAt: completedAt,
-    nextAttemptAt: null,
+    retryDelayMs: null,
+  });
+  options.onAttemptResult?.({
+    deliveryId: canonical.deliveryId,
+    eventId: canonical.eventId,
+    attemptNumber: attempt.attemptNumber,
+    resultClassification: result.classification,
+    deliveryStatus: "delivered",
+    responseStatus: result.responseStatus,
+    latencyMs: result.latencyMs,
   });
 }
 
@@ -271,6 +302,7 @@ export function createDeliveryWorker(
         totalAttempts: job.opts.attempts,
         requestTimeoutMs: options.requestTimeoutMs,
         retryPolicy,
+        onAttemptResult: options.onAttemptResult,
       }),
     {
       connection,

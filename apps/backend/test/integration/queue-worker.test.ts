@@ -39,6 +39,7 @@ const adminDatabaseUrl =
   process.env.HOOKRELAY_TEST_ADMIN_DATABASE_URL ??
   "postgresql://hookrelay:hookrelay@127.0.0.1:5432/postgres";
 const redisUrl = process.env.HOOKRELAY_TEST_REDIS_URL ?? "redis://127.0.0.1:6379";
+const redisDatabasePath = new URL(redisUrl).pathname;
 const testDatabaseName = "hookrelay_queue_test";
 
 function databaseUrlFor(databaseName: string): string {
@@ -89,7 +90,7 @@ class RedisTcpProxy {
 
   get url(): string {
     if (this.port === 0) throw new Error("Redis proxy has not been started.");
-    return `redis://127.0.0.1:${this.port}`;
+    return `redis://127.0.0.1:${this.port}${redisDatabasePath === "/" ? "" : redisDatabasePath}`;
   }
 
   async start(): Promise<void> {
@@ -348,7 +349,8 @@ describe("Task 3-7 BullMQ delivery pipeline", () => {
     expect(receivedBodies).toEqual([{ metadata: { a: 1, b: 2 }, orderId: 123 }]);
     expect(delivered?.deliveredAt).toBeInstanceOf(Date);
     expect(delivered?.attemptCount).toBe(1);
-    expect(await readAttempts(firstBody.delivery.id)).toMatchObject([
+    const attempts = await readAttempts(firstBody.delivery.id);
+    expect(attempts).toMatchObject([
       {
         attemptNumber: 1,
         responseStatus: 204,
@@ -357,6 +359,12 @@ describe("Task 3-7 BullMQ delivery pipeline", () => {
         errorMessage: null,
       },
     ]);
+    expect(delivered!.deliveredAt!.getTime()).toBeGreaterThanOrEqual(
+      delivered!.createdAt.getTime(),
+    );
+    expect(attempts[0]!.completedAt!.getTime()).toBeGreaterThanOrEqual(
+      attempts[0]!.startedAt.getTime(),
+    );
 
     const job = await queue?.queue.getJob(firstBody.delivery.id);
     expect(job?.id).toBe(firstBody.delivery.id);
@@ -653,11 +661,14 @@ describe("Task 3-7 BullMQ delivery pipeline", () => {
       (value) => value?.status === "retry_scheduled",
     );
     expect(retryScheduled?.nextAttemptAt).toBeInstanceOf(Date);
-    const remainingDelayMs = retryScheduled!.nextAttemptAt!.getTime() - Date.now();
-    expect(remainingDelayMs).toBeGreaterThan(300);
-    expect(remainingDelayMs).toBeLessThanOrEqual(retryDelayMs + 100);
+    const retryAttempts = await readAttempts(deliveryId);
+    const persistedDelayMs =
+      retryScheduled!.nextAttemptAt!.getTime() -
+      retryAttempts[0]!.completedAt!.getTime();
+    expect(persistedDelayMs).toBeGreaterThanOrEqual(retryDelayMs);
+    expect(persistedDelayMs).toBeLessThanOrEqual(retryDelayMs + 100);
     expect(retryScheduled?.attemptCount).toBe(1);
-    expect(await readAttempts(deliveryId)).toMatchObject([
+    expect(retryAttempts).toMatchObject([
       {
         attemptNumber: 1,
         responseStatus: 500,

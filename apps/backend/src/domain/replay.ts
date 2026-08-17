@@ -1,4 +1,4 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import type { AppDatabase } from "../db/client.js";
 import { deliveries } from "../db/schema.js";
 
@@ -117,6 +117,7 @@ export async function replayDelivery(
           endpointId: source.endpointId,
           replayedFromDeliveryId: source.id,
           replayIdempotencyKey: input.idempotencyKey,
+          createdAt: sql<Date>`clock_timestamp()`,
         })
         .returning(replaySelection);
 

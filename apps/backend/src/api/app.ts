@@ -3,6 +3,7 @@ import type { AppDatabase } from "../db/client.js";
 import type { DeliveryScheduler } from "../queue/delivery-queue.js";
 import { registerDeliveryReadRoutes } from "./delivery-read-routes.js";
 import { registerDomainRoutes } from "./domain-routes.js";
+import { registerMetricsRoutes } from "./metrics-routes.js";
 
 export type DependencyChecks = {
   postgres: () => Promise<void>;
@@ -12,6 +13,8 @@ export type DependencyChecks = {
 type DependencyStatus =
   | { status: "up" }
   | { status: "down"; error: string };
+
+const SAFE_DEPENDENCY_ERROR = "Dependency check failed.";
 
 export type BuildAppOptions = {
   dependencyChecks: DependencyChecks;
@@ -24,10 +27,10 @@ async function runCheck(check: () => Promise<void>): Promise<DependencyStatus> {
   try {
     await check();
     return { status: "up" };
-  } catch (error) {
+  } catch {
     return {
       status: "down",
-      error: error instanceof Error ? error.message : "Unknown dependency error",
+      error: SAFE_DEPENDENCY_ERROR,
     };
   }
 }
@@ -53,6 +56,7 @@ export function buildApp(options: BuildAppOptions): FastifyInstance {
   if (options.database) {
     registerDomainRoutes(app, options.database, options.deliveryScheduler);
     registerDeliveryReadRoutes(app, options.database);
+    registerMetricsRoutes(app, options.database);
   }
 
   app.setErrorHandler((error, request, reply) => {

@@ -10,13 +10,11 @@ export type StartedDeliveryAttempt = {
 };
 
 export type DeliveryAttemptFinalization = {
-  completedAt: Date;
   responseStatus: number | null;
   latencyMs: number;
   errorMessage: string | null;
   deliveryStatus: "retry_scheduled" | "delivered" | "dead_letter";
-  nextAttemptAt: Date | null;
-  deliveredAt: Date | null;
+  retryDelayMs: number | null;
 };
 
 export async function startDeliveryAttempt(
@@ -47,6 +45,7 @@ export async function startDeliveryAttempt(
       .values({
         deliveryId,
         attemptNumber: startedDelivery.attemptNumber,
+        startedAt: sql<Date>`clock_timestamp()`,
       })
       .returning({
         id: deliveryAttempts.id,
@@ -66,10 +65,11 @@ export async function finalizeDeliveryAttempt(
   finalization: DeliveryAttemptFinalization,
 ): Promise<void> {
   await db.transaction(async (transaction) => {
+    const databaseNow = sql<Date>`clock_timestamp()`;
     const [finalizedAttempt] = await transaction
       .update(deliveryAttempts)
       .set({
-        completedAt: finalization.completedAt,
+        completedAt: databaseNow,
         responseStatus: finalization.responseStatus,
         latencyMs: finalization.latencyMs,
         errorMessage: finalization.errorMessage,
@@ -94,8 +94,12 @@ export async function finalizeDeliveryAttempt(
       .update(deliveries)
       .set({
         status: finalization.deliveryStatus,
-        nextAttemptAt: finalization.nextAttemptAt,
-        deliveredAt: finalization.deliveredAt,
+        nextAttemptAt:
+          finalization.retryDelayMs === null
+            ? null
+            : sql<Date>`clock_timestamp() + (${finalization.retryDelayMs} * interval '1 millisecond')`,
+        deliveredAt:
+          finalization.deliveryStatus === "delivered" ? databaseNow : null,
       })
       .where(
         and(

@@ -13,6 +13,7 @@
     "build": "tsc -p tsconfig.build.json",
     "test": "vitest run --exclude \"test/integration/**\"",
     "test:integration": "vitest run test/integration",
+    "benchmark": "npm run build && node dist/benchmark/task-9-local.js",
     "typecheck": "tsc --noEmit",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "tsx src/db/migrate.ts"

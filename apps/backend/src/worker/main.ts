@@ -25,9 +25,21 @@ process.once("SIGTERM", () => requestShutdown("SIGTERM"));
 
 try {
   await checkDatabase(database);
-  deliveryWorker = createDeliveryWorker(database.db, config.redisUrl);
+  deliveryWorker = createDeliveryWorker(database.db, config.redisUrl, {
+    onAttemptResult: (event) => {
+      console.info(JSON.stringify({
+        event: "delivery_attempt_result",
+        ...event,
+      }));
+    },
+  });
   deliveryWorker.worker.on("failed", (job, error) => {
-    console.error(`Delivery job ${job?.id ?? "unknown"} failed:`, error.message);
+    console.error(JSON.stringify({
+      event: "delivery_job_failed",
+      deliveryId: job?.data.deliveryId ?? "unknown",
+      attemptsMade: job?.attemptsMade ?? null,
+      errorName: error.name,
+    }));
   });
   await deliveryWorker.worker.waitUntilReady();
 

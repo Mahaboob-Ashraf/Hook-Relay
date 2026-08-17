@@ -13,6 +13,7 @@
     "build": "npm run build --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
     "test:integration": "npm run test:integration --workspace @hookrelay/backend",
+    "benchmark": "npm run benchmark --workspace @hookrelay/backend",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "db:generate": "npm run db:generate --workspace @hookrelay/backend",
     "db:migrate": "npm run db:migrate --workspace @hookrelay/backend"
